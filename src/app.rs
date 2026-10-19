@@ -9,6 +9,7 @@ use crate::ago;
 use crate::collect::apply_clears;
 use crate::config::Config;
 use crate::model::{Kind, Row, RowKey, Ts};
+use crate::refresh::describe;
 use crate::slack::SlackError;
 use crate::state::{Cache, Clear, Clears};
 use crate::text;
@@ -66,6 +67,10 @@ pub struct Screen {
     pub rows: Vec<RowView>,
     pub selected: usize,
     pub status: Option<String>,
+    /// The last refresh's non-auth failure (auth shows as `Body::AuthError`).
+    pub error: Option<String>,
+    /// How many sources failed or truncated in the last refresh.
+    pub warnings: usize,
     pub body: Body,
 }
 
@@ -87,6 +92,8 @@ pub struct Header {
 
 pub struct RowView {
     pub text: String,
+    /// The whole message, line breaks kept, for the expanded row.
+    pub full: String,
     pub age: String,
     pub author: String,
     pub channel: String,
@@ -328,6 +335,7 @@ impl App {
             .iter()
             .map(|r| RowView {
                 text: text::one_line(&text::display(&r.shown.body, names)),
+                full: text::display(&r.shown.body, names),
                 age: ago::long(r.newest.to_utc(), now),
                 author: names
                     .users
@@ -366,6 +374,11 @@ impl App {
             rows: views,
             selected: self.sel,
             status,
+            error: match &self.cache.error {
+                Some(SlackError::Auth(_)) | None => None,
+                Some(e) => Some(describe(e)),
+            },
+            warnings: self.cache.warnings.len(),
             body,
         }
     }
@@ -409,6 +422,26 @@ mod tests {
         let act = app.handle_key(key(c), now());
         app.applied(&act, Ok(()));
         act
+    }
+
+    #[test]
+    fn screen_carries_full_text_and_non_auth_error() {
+        let mut a = app();
+        let mut c = sample_cache(now());
+        c.error = Some(SlackError::Http("search.messages: timed out".into()));
+        c.warnings = vec!["a".into(), "b".into()];
+        a.set_cache(c);
+        let s = a.screen(now());
+        assert_eq!(s.error.as_deref(), Some("search.messages: timed out"));
+        assert_eq!(s.warnings, 2);
+        assert_eq!(s.body, Body::Rows);
+        assert!(s.rows[1].full.starts_with("@Jay can you sanity check"));
+        a.set_cache({
+            let mut c = sample_cache(now());
+            c.error = Some(SlackError::Auth("invalid_auth".into()));
+            c
+        });
+        assert_eq!(a.screen(now()).error, None);
     }
 
     #[test]

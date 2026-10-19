@@ -261,7 +261,7 @@ fn is_im(channel: &str) -> bool {
     channel.starts_with('D')
 }
 
-fn describe(e: &SlackError) -> String {
+pub(crate) fn describe(e: &SlackError) -> String {
     match e {
         SlackError::Auth(code) => format!("auth: {code}"),
         SlackError::RateLimited(method) => format!("{method}: rate limited"),

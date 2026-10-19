@@ -1,0 +1,16 @@
+---
+source: src/ui/mod.rs
+expression: "text(&draw(&a, 80, 12))"
+---
+Slack inbox │ 0 need attention   sort: oldest waiting │ synced 2 min ago
+ Nothing needs you right now.
+ New activity on cleared threads will bring them back.
+
+
+
+
+
+
+
+j/k move  ␣ expand  o open  O open+clear  x clear  u undo  r refresh  s sort
+g/G top/bottom  q quit

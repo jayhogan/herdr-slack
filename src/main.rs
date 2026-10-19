@@ -7,6 +7,8 @@ mod ago;
 mod app;
 #[cfg(test)]
 mod fixtures;
+#[cfg(test)]
+mod ui;
 
 // Compiled for tests only until a later task wires a caller.
 #[cfg(test)]

@@ -1,0 +1,36 @@
+---
+source: src/ui/mod.rs
+expression: "text(&draw(&app(), 40, 32))"
+---
+Slack inbox │ 9 need attention
+▌Review the Q4 audit-log re…  3 days ago
+ Dana Okafor  #epd  [watch]
+
+ @Jay can you sanity check t…  4 min ago
+ Marc…  #co…  [watch] [mention] [thread]
+
+ @core anyone own the flaky …  1 day ago
+ Priya Shah  #ci-alerts  [mention]
+
+ Re your RFC: I’d keep the…  6 hours ago
+ Theo Marsh  #core-eng  [reply]
+
+ SEV3 resolved: delayed ba…  3 hours ago
+ Lena Ruiz  #incidents  [channel]
+
+ Pushed a fix for the date …  52 min ago
+ Sam Patel  #books-pod  [thread]
+
+ @Jay thanks, merged! One f…  18 min ago
+ Ava Chen  #docket  [mention] [reply]
+
+ Quick one: are you joining…  10 min ago
+ Dana Okafor  @Dana Okafor  [dm]
+
+ Reminder: deploy freeze sta…  2 min ago
+ Nora Kim  #core-eng  [channel]
+
+                                     1/9
+j/k move  ␣ expand  o open  O open+clear
+x clear  u undo  r refresh  s sort
+g/G top/bottom  q quit

@@ -1,0 +1,28 @@
+---
+source: src/ui/mod.rs
+expression: "text(&draw(&a, 80, 24))"
+---
+Slack inbox │ 9 need attention   sort: oldest waiting │ synced 2 min ago
+▌Review the Q4 audit-log retention proposal before Thursday’s EPD     3 days ago
+ sync. We need a yes/no on 90 vs 365 days for actor + diff payloads,
+ and whether the 365-day tier moves to cold storage after 30. Doc is
+ linked in the thread, comments welcome inline.
+ Dana Okafor  #epd  [watch]
+
+ @Jay can you sanity check the migration plan for the ledger backfil…  4 min ago
+ Marcus Lee  #core-eng  [watch] [mention] [thread]
+
+ @core anyone own the flaky checkout e2e? It’s failed 3 of the last …  1 day ago
+ Priya Shah  #ci-alerts  [mention]
+
+ Re your RFC: I’d keep the poller separate from the TUI so the ove…  6 hours ago
+ Theo Marsh  #core-eng  [reply]
+
+ SEV3 resolved: delayed bank sync for a subset of accounts between…  3 hours ago
+ Lena Ruiz  #incidents  [channel]
+
+ Pushed a fix for the date picker timezone bug, mind taking another…  52 min ago
+ Sam Patel  #books-pod  [thread]
+                                                                             1/9
+j/k move  ␣ expand  o open  O open+clear  x clear  u undo  r refresh  s sort
+g/G top/bottom  q quit
