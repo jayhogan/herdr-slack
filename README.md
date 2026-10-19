@@ -13,7 +13,7 @@ Each row has two lines: the newest unhandled message and its age, then the autho
 Requires a Rust toolchain (1.89+) and a Slack user token (below).
 
 ```sh
-git clone <this repo> ~/dev/herdr-slack
+git clone https://github.com/jayhogan/herdr-slack ~/dev/herdr-slack
 herdr plugin link ~/dev/herdr-slack   # builds, registers the plugin
 ~/dev/herdr-slack/scripts/install.sh  # puts the binary on PATH
 ```
@@ -93,7 +93,8 @@ shows in the status line.
 ### Config
 
 Optional `${XDG_CONFIG_HOME:-~/.config}/herdr-slack/config.json`. Every field is optional; a
-missing file means defaults.
+missing file means defaults. Set `channels` to the channels you want to follow (for example
+`{"channels": ["#incidents"]}`): it defaults to none, so no channel posts show until you do.
 
 | Field | Default | Meaning |
 |---|---|---|
@@ -138,7 +139,8 @@ until the reaction is gone.
 - A DM becomes one row keyed by the channel; a DM message with replies or a watch gets its own
   thread row and leaves the DM row.
 - Not covered: threads you follow without having posted in them, Slack's own "Later" list (no API;
-  watches replace it), and more than one workspace. Messages you wrote never create a row.
+  watches replace it), replies in a group-DM thread whose root is older than the DM lookback and
+  that you never posted in, and more than one workspace. Messages you wrote never create a row.
 
 ### Checking for gaps
 
