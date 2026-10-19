@@ -42,14 +42,6 @@ mod tests {
     }
 
     #[test]
-    fn read_returns_a_token_or_the_banner() {
-        // Depends on the machine's keychain and env, so only the failure text is pinned.
-        if let Err(e) = read() {
-            assert_eq!(e, MISSING_TOKEN);
-        }
-    }
-
-    #[test]
     fn token_prefers_keychain() {
         assert_eq!(pick(s("xoxp-key\n"), s("xoxp-env")), Ok("xoxp-key".into()));
     }

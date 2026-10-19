@@ -1,6 +1,8 @@
 //! Paged Slack sources (spec §4 findings, §6 "Refresh"): each function pages to the end of its
 //! window and returns parsed `Msg`s.
 
+use std::collections::BTreeSet;
+
 use chrono::{DateTime, Duration, Utc};
 use serde_json::Value;
 
@@ -125,6 +127,7 @@ fn paged_messages(
 ) -> Result<Vec<Msg>, SlackError> {
     let mut msgs = Vec::new();
     let mut cursor = String::new();
+    let mut pager = Pager::default();
     loop {
         let mut p = vec![("channel", channel.to_owned()), ("limit", "200".into())];
         p.extend(params.iter().cloned());
@@ -134,17 +137,39 @@ fn paged_messages(
         let body = s.call(method, &p)?;
         let page = body["messages"].as_array().map_or(&[][..], Vec::as_slice);
         msgs.extend(page.iter().filter_map(|m| parse_message(channel, m)));
-        cursor = next_cursor(&body);
+        cursor = pager.next(method, &body)?;
         if cursor.is_empty() {
             return Ok(msgs);
         }
     }
 }
 
-fn next_cursor(body: &Value) -> String {
-    str_at(body, &["response_metadata", "next_cursor"])
-        .unwrap_or("")
-        .to_owned()
+/// Slack's cursor paging, guarded: a repeated cursor or more than 1000 pages is an error
+/// rather than an endless loop or a silent cap (§7).
+#[derive(Default)]
+struct Pager {
+    seen: BTreeSet<String>,
+    pages: u32,
+}
+
+const MAX_PAGES: u32 = 1000;
+
+impl Pager {
+    /// The cursor for the next page; empty at the end.
+    fn next(&mut self, method: &str, body: &Value) -> Result<String, SlackError> {
+        self.pages += 1;
+        let cursor = str_at(body, &["response_metadata", "next_cursor"]).unwrap_or("");
+        if cursor.is_empty() {
+            return Ok(String::new());
+        }
+        if self.pages >= MAX_PAGES {
+            return Err(SlackError::Api(format!("{method}: over {MAX_PAGES} pages")));
+        }
+        if !self.seen.insert(cursor.to_owned()) {
+            return Err(SlackError::Api(format!("{method}: repeated cursor")));
+        }
+        Ok(cursor.to_owned())
+    }
 }
 
 /// A thread: the root first, then its replies.
@@ -178,6 +203,7 @@ fn channel_list(
 ) -> Result<Vec<(String, String)>, SlackError> {
     let mut out = Vec::new();
     let mut cursor = String::new();
+    let mut pager = Pager::default();
     loop {
         let mut p = vec![
             ("types", types.to_owned()),
@@ -193,7 +219,7 @@ fn channel_list(
             let name = c["name"].as_str().unwrap_or("");
             Some((c["id"].as_str()?.to_owned(), name.to_owned()))
         }));
-        cursor = next_cursor(&body);
+        cursor = pager.next(method, &body)?;
         if cursor.is_empty() {
             return Ok(out);
         }
@@ -280,6 +306,7 @@ mod tests {
     use super::*;
     use crate::slack::fake::FakeSlack;
     use chrono::TimeZone;
+    use std::cell::RefCell;
 
     const SEARCH_P1: &str = include_str!("../tests/fixtures/search-p1.json");
     const SEARCH_P2: &str = include_str!("../tests/fixtures/search-p2.json");
@@ -408,6 +435,58 @@ mod tests {
                 "1792096100.000100",
                 "1792096000.000200"
             ]
+        );
+    }
+
+    /// T4: a `next_cursor` that comes back again, or paging past 1000 pages, is an error,
+    /// not an endless loop or a silent cap.
+    #[test]
+    fn cursor_loops_are_errors() {
+        let stuck =
+            r#"{"ok":true,"messages":[],"channels":[],"response_metadata":{"next_cursor":"c1"}}"#;
+        let fake = FakeSlack::new()
+            .on("conversations.history", &[], Ok(stuck))
+            .on("users.conversations", &[], Ok(stuck));
+        assert_eq!(
+            history(&fake, "C0CORE", &Ts("1".into())),
+            Err(SlackError::Api(
+                "conversations.history: repeated cursor".into()
+            ))
+        );
+        assert_eq!(
+            mpims(&fake),
+            Err(SlackError::Api(
+                "users.conversations: repeated cursor".into()
+            ))
+        );
+        assert_eq!(fake.calls.borrow().len(), 4);
+
+        /// A new cursor on every page, forever.
+        struct Endless(RefCell<u32>);
+        impl Slack for Endless {
+            fn call(&self, _: &str, _: &[(&str, String)]) -> Result<Value, SlackError> {
+                *self.0.borrow_mut() += 1;
+                let n = *self.0.borrow();
+                Ok(
+                    serde_json::json!({"ok": true, "messages": [], "channels": [],
+                    "response_metadata": {"next_cursor": format!("c{n}")}}),
+                )
+            }
+        }
+        let endless = Endless(RefCell::new(0));
+        assert_eq!(
+            replies(&endless, "C0CORE", &Ts("1".into())),
+            Err(SlackError::Api(
+                "conversations.replies: over 1000 pages".into()
+            ))
+        );
+        assert_eq!(*endless.0.borrow(), 1000);
+        let endless = Endless(RefCell::new(0));
+        assert_eq!(
+            channels(&endless),
+            Err(SlackError::Api(
+                "conversations.list: over 1000 pages".into()
+            ))
         );
     }
 
