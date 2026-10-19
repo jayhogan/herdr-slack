@@ -25,6 +25,8 @@ pub struct Reads {
     pub channels: BTreeMap<String, Read<Vec<Msg>>>,  // curated, top-level
     pub dms: BTreeMap<String, Read<Vec<Msg>>>, // IM / MPIM history, top-level (absent = not read)
     pub dm_channels: BTreeSet<String>,         // every channel id known to be an IM or MPIM
+    /// Threads Slack says are gone or unreadable for good (deleted, channel left).
+    pub gone: BTreeSet<ThreadId>,
 }
 
 pub struct Windows {
@@ -75,6 +77,9 @@ pub fn collect(reads: &Reads, prev: &[Row], clears: &Clears, win: &Windows) -> V
     dm_events(reads, &hints, &mut events);
     let mut rows = build(reads, clears, events);
     for p in apply_clears(prev.to_vec(), clears) {
+        let Some(p) = forget_gone(reads, p) else {
+            continue;
+        };
         match rows.get_mut(&p.key) {
             Some(row) => merge(reads, row, p),
             None => {
@@ -425,6 +430,16 @@ fn drop_unwatched(reads: &Reads, row: &mut Row) {
     }
 }
 
+/// A gone thread's row keeps only a watch the watch read still holds (or couldn't check).
+fn forget_gone(reads: &Reads, mut row: Row) -> Option<Row> {
+    if !thread_id(&row).is_some_and(|id| reads.gone.contains(&id)) {
+        return Some(row);
+    }
+    drop_unwatched(reads, &mut row);
+    row.kinds.retain(|k| *k == Kind::Watch);
+    (!row.kinds.is_empty()).then_some(row)
+}
+
 /// Rule 8: keep a row this refresh didn't rebuild when nothing proved it resolved.
 fn carry(reads: &Reads, win: &Windows, mut row: Row) -> Option<Row> {
     drop_unwatched(reads, &mut row);
@@ -529,6 +544,7 @@ mod tests {
             channels: BTreeMap::new(),
             dms: BTreeMap::new(),
             dm_channels: BTreeSet::from([D.to_string(), "G0MPDM1".to_string()]),
+            gone: BTreeSet::new(),
         }
     }
 
@@ -966,6 +982,39 @@ mod tests {
         r.mentions_complete = true;
         let rows = collect(&r, &[prev], &Clears::default(), &win());
         assert_eq!(keys(&rows), [RowKey::thread("C0PLAT", &ts(5)).0]);
+    }
+
+    /// F6: a gone thread's rows go, except a watch the watch read still shows.
+    #[test]
+    fn gone_thread_keeps_only_a_live_watch() {
+        let top = root(C, 1, DANA, 1);
+        let mut prev = row(
+            RowKey::thread(C, &ts(1)),
+            C,
+            &[Kind::Watch, Kind::Thread],
+            reply(C, 2, 1, DANA),
+            2,
+            1,
+        );
+        prev.watched = Some(ts(1));
+        let mut r = reads();
+        r.threads.insert(
+            tid(C, 1),
+            Err("conversations.replies: thread_not_found".into()),
+        );
+        r.gone.insert(tid(C, 1));
+        r.watched = Ok(vec![top.clone()]);
+        let rows = collect(&r, slice::from_ref(&prev), &Clears::default(), &win());
+        assert_eq!(keys(&rows), [prev.key.0.clone()]);
+        assert_eq!(rows[0].kinds, [Kind::Watch]);
+        // Watch read failed: the watch is kept, the thread kind still goes.
+        r.watched = Err("ratelimited".into());
+        let rows = collect(&r, slice::from_ref(&prev), &Clears::default(), &win());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kinds, [Kind::Watch]);
+        // No longer watched: nothing left.
+        r.watched = Ok(vec![]);
+        assert!(collect(&r, &[prev], &Clears::default(), &win()).is_empty());
     }
 
     #[test]

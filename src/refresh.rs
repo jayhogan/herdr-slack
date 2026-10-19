@@ -186,8 +186,12 @@ pub fn run(
         due.entry(id.clone()).or_insert(true);
     }
     let mut threads = BTreeMap::new();
+    let mut gone = BTreeSet::new();
     for id in due.into_iter().filter(|(_, d)| *d).map(|(id, _)| id) {
         let read = sources::replies(s, &id.channel, &id.root);
+        if read.as_ref().is_err_and(is_gone) {
+            gone.insert(id.clone());
+        }
         let source = format!("{} thread", label(&names, &id.channel));
         threads.insert(id, keep(read, &mut warn, &source));
     }
@@ -207,6 +211,7 @@ pub fn run(
         channels,
         dms,
         dm_channels,
+        gone,
     };
     readd_watches(&reads, clears, now);
     let rows = collect(&reads, &prev.rows, clears, &win);
@@ -218,6 +223,10 @@ pub fn run(
             .entry(msg_id(&id.channel, &id.root))
             .or_insert_with(|| ts.clone());
         *at = at.clone().max(ts);
+    }
+    // A gone thread is never read again (its warning shows this refresh only).
+    for id in &reads.gone {
+        state.known_threads.remove(&msg_id(&id.channel, &id.root));
     }
     // Expire only what a successful read this refresh shows quiet for 14 days.
     let expiry = unix(now - Duration::days(KNOWN_THREAD_DAYS));
@@ -335,6 +344,13 @@ fn unix(t: DateTime<Utc>) -> Ts {
 /// A 1:1 DM id.
 fn is_im(channel: &str) -> bool {
     channel.starts_with('D')
+}
+
+/// Error codes that say a thread is gone for good (deleted, or its channel is unreadable).
+const GONE_CODES: [&str; 3] = ["thread_not_found", "channel_not_found", "not_in_channel"];
+
+fn is_gone(e: &SlackError) -> bool {
+    matches!(e, SlackError::Api(m) if m.rsplit(": ").next().is_some_and(|c| GONE_CODES.contains(&c)))
 }
 
 pub(crate) fn describe(e: &SlackError) -> String {
@@ -1218,6 +1234,63 @@ mod tests {
         assert_eq!(cache.rows[0].shown.user, "U0DANA");
         // Past 14 days but its read failed: still tracked.
         assert_eq!(state.known_threads[&gone], Ts(ago(15 * DAY)));
+    }
+
+    /// F6: a thread Slack says is gone stops being tracked, its rows go, and it warns only
+    /// in the refresh that found out.
+    #[test]
+    fn gone_thread_is_dropped_and_warned_once() {
+        let root_ts = ago(3 * DAY);
+        let key = format!("C0CORE:{root_ts}");
+        let row = prev_row(&key, Kind::Thread, &ago(2 * DAY), Some(&root_ts), "U0DANA");
+        let prev = prev_cache(&row, Some("#core"));
+        let mut state = seeded();
+        state.known_threads.insert(key.clone(), Ts(ago(2 * DAY)));
+        for code in ["thread_not_found", "channel_not_found", "not_in_channel"] {
+            let mut state = state.clone();
+            let gone = || {
+                base().on(
+                    "conversations.replies",
+                    &[],
+                    Err(SlackError::Api(format!("conversations.replies: {code}"))),
+                )
+            };
+            let first = gone();
+            let cache = run_with(&first, &Config::default(), &mut state, &prev);
+            assert_eq!(
+                cache.warnings,
+                [format!("#core thread: conversations.replies: {code}")]
+            );
+            assert!(cache.rows.is_empty(), "{code}: {:?}", cache.rows);
+            assert!(state.known_threads.is_empty(), "{code}");
+            let second = gone();
+            let again = run_with(&second, &Config::default(), &mut state, &cache);
+            assert!(calls(&second, "conversations.replies").is_empty());
+            assert!(again.warnings.is_empty(), "{:?}", again.warnings);
+        }
+    }
+
+    /// A curated channel we can't read is a config problem: it warns every refresh, with one
+    /// call per refresh.
+    #[test]
+    fn unreadable_channel_warns_each_refresh_with_one_call() {
+        let mut state = seeded();
+        let mut prev = Cache::default();
+        for _ in 0..2 {
+            let fake = base().on(
+                "conversations.history",
+                &[("channel", "C0INC")],
+                Err(SlackError::Api(
+                    "conversations.history: not_in_channel".into(),
+                )),
+            );
+            prev = run_with(&fake, &incidents(), &mut state, &prev);
+            assert_eq!(
+                prev.warnings,
+                ["#incidents: conversations.history: not_in_channel"]
+            );
+            assert_eq!(calls(&fake, "conversations.history").len(), 1);
+        }
     }
 
     #[test]
