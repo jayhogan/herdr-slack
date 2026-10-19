@@ -10,6 +10,8 @@ mod collect;
 #[cfg(test)]
 mod config;
 #[cfg(test)]
+mod fetch;
+#[cfg(test)]
 mod model;
 #[cfg(test)]
 mod refresh;
