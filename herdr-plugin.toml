@@ -1,0 +1,9 @@
+id = "herdr-slack"
+name = "Slack inbox"
+version = "0.1.0"
+description = "What needs you in Slack."
+min_herdr_version = "0.9.0"
+platforms = ["linux", "macos"]
+
+[[build]]
+command = ["cargo", "build", "--release"]
