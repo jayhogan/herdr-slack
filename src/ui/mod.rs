@@ -70,6 +70,32 @@ mod tests {
     }
 
     #[test]
+    fn header_drops_sort_then_breakdown_then_synced() {
+        let screen = app().screen(now());
+        let h = |w: usize| {
+            let line = list::header_line(&screen.header, w);
+            line.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        };
+        let full = "Slack inbox │ 9 need attention · 2 watch · 3 mention · 2 reply · 2 thread · 2 channel · 1 dm   sort: oldest waiting │ synced 2 min ago";
+        let w = full.chars().count();
+        assert_eq!(h(w).trim_end(), full);
+        let no_sort = full
+            .replace(" │ synced", "")
+            .replace("   sort: oldest waiting", "   synced");
+        assert_eq!(h(w - 1).trim_end(), no_sort);
+        let wn = no_sort.chars().count();
+        assert_eq!(
+            h(wn - 1).trim_end(),
+            "Slack inbox │ 9 need attention   synced 2 min ago"
+        );
+        assert_eq!(h(40).trim_end(), "Slack inbox │ 9 need attention");
+        assert_eq!(h(20).trim_end(), "Slack inbox │ 9 nee…");
+    }
+
+    #[test]
     fn wide_120() {
         insta::assert_snapshot!(text(&draw(&app(), 120, 36)));
     }

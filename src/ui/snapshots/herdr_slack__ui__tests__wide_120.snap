@@ -2,7 +2,7 @@
 source: src/ui/mod.rs
 expression: "text(&draw(&app(), 120, 36))"
 ---
-Slack inbox │ 9 need attention   sort: oldest waiting │ synced 2 min ago
+Slack inbox │ 9 need attention · 2 watch · 3 mention · 2 reply · 2 thread · 2 channel · 1 dm   synced 2 min ago
 ▌Review the Q4 audit-log retention proposal before Thursday’s EPD sync. We need a yes/no on 90 vs 365 days …  3 days ago
  Dana Okafor  #epd  [watch]
 

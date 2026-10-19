@@ -59,7 +59,7 @@ pub fn render(frame: &mut Frame, screen: &Screen, scroll: &mut usize) {
     frame.render_widget(Paragraph::new(bottom), rect(header_h + list_h, bottom_h));
 }
 
-fn header_line(h: &Header, w: usize) -> Line<'static> {
+pub(super) fn header_line(h: &Header, w: usize) -> Line<'static> {
     let sort = match h.sort {
         Sort::OldestWaiting => "oldest waiting",
         Sort::NewestActivity => "newest activity",
@@ -92,23 +92,14 @@ fn header_line(h: &Header, w: usize) -> Line<'static> {
         }
         s
     };
-    // Narrow: drop the breakdown first, then the sort, then the sync age. A warning replaces the
-    // breakdown and outlives the sort.
-    let steps = if h.warning.is_some() {
-        [
-            (true, true, true),
-            (true, false, true),
-            (false, false, true),
-            (false, false, false),
-        ]
-    } else {
-        [
-            (true, true, true),
-            (false, true, true),
-            (false, false, true),
-            (false, false, false),
-        ]
-    };
+    // Narrow: drop the sort first, then the breakdown (or the warning that replaces it), then
+    // the sync age.
+    let steps = [
+        (true, true, true),
+        (true, false, true),
+        (false, false, true),
+        (false, false, false),
+    ];
     let text = steps
         .into_iter()
         .map(|(m, s, y)| build(m, s, y))

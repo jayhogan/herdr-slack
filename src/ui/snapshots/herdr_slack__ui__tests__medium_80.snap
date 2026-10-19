@@ -2,7 +2,7 @@
 source: src/ui/mod.rs
 expression: "text(&draw(&app(), 80, 32))"
 ---
-Slack inbox │ 9 need attention   sort: oldest waiting │ synced 2 min ago
+Slack inbox │ 9 need attention   synced 2 min ago
 ▌Review the Q4 audit-log retention proposal before Thursday’s EPD s…  3 days ago
  Dana Okafor  #epd  [watch]
 

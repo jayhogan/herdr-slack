@@ -2,7 +2,7 @@
 source: src/ui/mod.rs
 expression: "text(&draw(&a, 80, 24))"
 ---
-Slack inbox │ 9 need attention   sort: oldest waiting │ synced 2 min ago
+Slack inbox │ 9 need attention   synced 2 min ago
 ▌Review the Q4 audit-log retention proposal before Thursday’s EPD     3 days ago
  sync. We need a yes/no on 90 vs 365 days for actor + diff payloads,
  and whether the 365-day tier moves to cold storage after 30. Doc is

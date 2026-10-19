@@ -2,7 +2,7 @@
 source: src/ui/mod.rs
 expression: "text(&draw(&a, 80, 12))"
 ---
-Slack inbox │ 9 need attention   sort: oldest waiting │ synced 2 min ago
+Slack inbox │ 9 need attention   synced 2 min ago
  Slack token missing or invalid. Add it with: security add-generic-password -s
  herdr-slack -a "$USER" -w
 
