@@ -1,4 +1,4 @@
-//! herdr-slack: a pane listing the Slack threads that need you.
+//! herdr-slack CLI and pane entry: args, `verify`, the TUI (spec §3 "How it runs", §7, §9).
 
 // Compiled for tests only until the UI task calls it.
 #[cfg(test)]

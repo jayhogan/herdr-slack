@@ -1,4 +1,4 @@
-//! Relative "5 min ago" labels.
+//! Relative "2 min ago" labels for a row's first line (spec §9).
 
 use chrono::{DateTime, Utc};
 
