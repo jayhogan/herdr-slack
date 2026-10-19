@@ -3,6 +3,10 @@
 // Compiled for tests only until the UI task calls it.
 #[cfg(test)]
 mod ago;
+#[cfg(test)]
+mod app;
+#[cfg(test)]
+mod fixtures;
 
 // Compiled for tests only until a later task wires a caller.
 #[cfg(test)]
