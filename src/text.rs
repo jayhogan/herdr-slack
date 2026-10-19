@@ -1,7 +1,7 @@
 //! Message text rendering (spec §8).
 
 use serde_json::Value;
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthStr;
 
 use crate::model::Names;
 
@@ -200,6 +200,19 @@ pub fn width(s: &str) -> usize {
     UnicodeWidthStr::width(s)
 }
 
+/// Byte length of the longest prefix of `s` that measures at most `w` cells (str-level width).
+fn prefix_end(s: &str, w: usize) -> usize {
+    let mut end = 0;
+    for (i, c) in s.char_indices() {
+        let next = i + c.len_utf8();
+        if width(&s[..next]) > w {
+            break;
+        }
+        end = next;
+    }
+    end
+}
+
 /// Fit `s` in `w` cells, ending with `…` when cut.
 pub fn truncate(s: &str, w: usize) -> String {
     if width(s) <= w {
@@ -208,16 +221,7 @@ pub fn truncate(s: &str, w: usize) -> String {
     if w == 0 {
         return String::new();
     }
-    let mut out = String::new();
-    let mut used = 0;
-    for c in s.chars() {
-        let cw = c.width().unwrap_or(0);
-        if used + cw > w - 1 {
-            break;
-        }
-        out.push(c);
-        used += cw;
-    }
+    let mut out = s[..prefix_end(s, w - 1)].to_owned();
     out.push('…');
     out
 }
@@ -245,16 +249,7 @@ pub fn wrap(s: &str, w: usize, max_lines: usize) -> Vec<String> {
                     continue;
                 }
                 // Word wider than a line: split it by cells.
-                let mut used = 0;
-                let mut cut = word.len();
-                for (i, c) in word.char_indices() {
-                    let cw = c.width().unwrap_or(0);
-                    if used + cw > w {
-                        cut = i;
-                        break;
-                    }
-                    used += cw;
-                }
+                let mut cut = prefix_end(word, w);
                 if cut == 0 {
                     cut = word.chars().next().map_or(word.len(), char::len_utf8);
                 }
@@ -359,6 +354,13 @@ mod tests {
         assert_eq!(truncate("abc", 3), "abc");
         assert_eq!(truncate("abcd", 3), "ab…");
         assert_eq!(width("日本"), 4);
+    }
+
+    #[test]
+    fn truncate_uses_str_width_for_emoji_sequences() {
+        assert!(width(&truncate("❤️❤️❤️", 5)) <= 5);
+        assert_eq!(truncate("👍🏽ab", 4), "👍🏽ab");
+        assert!(width(&truncate("👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧", 5)) <= 5);
     }
 
     #[test]
