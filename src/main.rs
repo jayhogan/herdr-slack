@@ -22,7 +22,7 @@ mod watch;
 use std::env;
 use std::io;
 use std::process::ExitCode;
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant, SystemTime};
 
 use chrono::{DateTime, Utc};
@@ -241,9 +241,17 @@ impl Live {
             self.next_clears_reload = now + CLEARS_EVERY;
         }
         for req in self.poller.due(now) {
-            let _ = self.requests.send(req); // a dead worker leaves the last data on screen
+            let _ = self.requests.send(req); // a dead worker shows as stopped (below)
         }
-        while let Ok(ev) = self.events.try_recv() {
+        loop {
+            let ev = match self.events.try_recv() {
+                Ok(ev) => ev,
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    app.set_stopped();
+                    break;
+                }
+            };
             match ev {
                 FetchEvent::Started => app.set_loading(true),
                 FetchEvent::Done(cache) => {
@@ -847,6 +855,31 @@ mod tests {
         )
         .unwrap();
         assert!(queue.borrow().is_empty());
+    }
+
+    /// T10: when the worker is gone the status says so, and a key press doesn't hide it.
+    #[test]
+    fn dead_worker_is_shown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (requests, _worker_rx) = std::sync::mpsc::channel();
+        let (worker_tx, events) = std::sync::mpsc::channel::<FetchEvent>();
+        drop(worker_tx);
+        let mut live = Live {
+            requests,
+            events,
+            poller: Poller::new(Instant::now(), Duration::from_secs(180)),
+            state: StateDir::new(tmp.path().to_path_buf()),
+            slack_ui: HttpSlack::new("xoxp-test".into(), false),
+            next_clears_reload: Instant::now(),
+            cache_seen: None,
+            me: None,
+        };
+        let mut a = app(&Config::default());
+        live.tick(&mut a);
+        let stopped = "refresh stopped — restart herdr-slack";
+        assert_eq!(status(&a).as_deref(), Some(stopped));
+        a.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE), now());
+        assert_eq!(status(&a).as_deref(), Some(stopped));
     }
 
     #[test]

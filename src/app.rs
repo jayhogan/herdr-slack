@@ -49,6 +49,8 @@ pub struct UndoEntry {
     pub rewatch: Option<(String, Ts)>,
 }
 
+const STOPPED: &str = "refresh stopped — restart herdr-slack";
+
 pub struct App {
     cache: Cache,
     clears: Clears,
@@ -60,6 +62,8 @@ pub struct App {
     cfg: Config,
     loading: bool,
     auth_error: Option<String>,
+    /// The background refresh died; shown whenever no toast is.
+    stopped: bool,
 }
 
 pub struct Screen {
@@ -114,6 +118,7 @@ impl App {
             cfg,
             loading: false,
             auth_error: None,
+            stopped: false,
         }
     }
 
@@ -145,6 +150,11 @@ impl App {
 
     pub fn set_status(&mut self, s: String) {
         self.status = Some(s);
+    }
+
+    /// The refresh worker is gone: say so until restart.
+    pub fn set_stopped(&mut self) {
+        self.stopped = true;
     }
 
     /// Main could not read the token: show the banner.
@@ -362,6 +372,7 @@ impl App {
         let status = self
             .status
             .clone()
+            .or_else(|| self.stopped.then(|| STOPPED.to_string()))
             .or_else(|| self.loading.then(|| "Refreshing…".to_string()));
         Screen {
             header: Header {
