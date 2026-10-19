@@ -145,12 +145,14 @@ per source, Slack's match count against how many matches the list explains:
 
 ```
 <@U0ME> after:2026-10-10: 27 matches · 20 in list · 2 mine · 4 answered · 1 cleared · 0 ignored · 0 unexplained
-watches: 3 in list / 5 watched
+watches: 3 watched · 3 in list · 0 cleared · 0 unexplained
 ```
 
-Each unexplained match is listed as its channel and ts, never its text. The exit code is 1 when
-anything is unexplained or on error. The `watches` line differs when baseline messages carry your
-emoji. It uses the cache from your last refresh, so run it after the app has refreshed.
+The `watches` line checks the watches the app holds in `state.json` (baseline messages are
+already left out) against the list: how many are in the list, how many were cleared, and how many
+are neither. Each unexplained match or watch is listed as its channel and ts, never its text. The
+exit code is 1 when anything is unexplained or on error. It uses the cache and state from your
+last refresh, so run it after the app has refreshed.
 
 ## Development
 

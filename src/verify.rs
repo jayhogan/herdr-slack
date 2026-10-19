@@ -6,11 +6,11 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Utc};
 
 use crate::config::Config;
-use crate::model::{Kind, Msg, RowKey, Ts};
+use crate::model::{Msg, RowKey, Ts};
 use crate::refresh::{mention_queries, search_after};
 use crate::slack::{Slack, SlackError};
 use crate::sources;
-use crate::state::{Cache, Clears};
+use crate::state::{Cache, Clears, State};
 
 pub struct Report {
     pub text: String,
@@ -35,6 +35,7 @@ pub fn run(
     cfg: &Config,
     cache: &Cache,
     clears: &Clears,
+    state: &State,
     now: DateTime<Utc>,
 ) -> Result<Report, SlackError> {
     let me = sources::me(s)?.user_id;
@@ -67,22 +68,45 @@ pub fn run(
             found.msgs.len(),
         ));
     }
-    let in_list = cache
-        .rows
-        .iter()
-        .filter(|r| r.kinds.contains(&Kind::Watch))
-        .count();
-    let (watched, _) = sources::watches(s, &me, &cfg.watch_emoji)?;
-    lines.push(format!(
-        "watches: {in_list} in list / {} watched",
-        watched.len()
-    ));
+    lines.push(watch_line(cache, clears, state, &mut unexplained));
     let count = unexplained.len();
     lines.extend(unexplained);
     Ok(Report {
         text: lines.join("\n"),
         unexplained: count,
     })
+}
+
+/// Counts the watches held in state.json (past the baseline) by what explains them. Each
+/// unexplained one is added to `unexplained`.
+fn watch_line(
+    cache: &Cache,
+    clears: &Clears,
+    state: &State,
+    unexplained: &mut Vec<String>,
+) -> String {
+    let (mut in_list, mut cleared, mut none) = (0, 0, 0);
+    for m in state.watch.watched.values() {
+        let keys = keys(m);
+        let gone = keys.iter().any(|k| {
+            clears
+                .entries
+                .get(k)
+                .is_some_and(|c| !c.keep_watch && m.ts <= c.wm)
+        });
+        if gone {
+            cleared += 1;
+        } else if cache.rows.iter().any(|r| keys.contains(&r.key)) {
+            in_list += 1;
+        } else {
+            none += 1;
+            unexplained.push(format!("  {} {}", label(cache, &m.channel), m.ts.0));
+        }
+    }
+    format!(
+        "watches: {} watched · {in_list} in list · {cleared} cleared · {none} unexplained",
+        state.watch.watched.len()
+    )
 }
 
 /// Row keys a match can belong to, as `collect` keys them: its thread, and for a top-level
@@ -151,9 +175,9 @@ fn label(cache: &Cache, channel: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Row, parse_search_match};
+    use crate::model::{Kind, Row, parse_search_match};
     use crate::slack::fake::FakeSlack;
-    use crate::state::Clear;
+    use crate::state::{Clear, WatchState};
     use chrono::TimeZone;
     use serde_json::{Value, json};
 
@@ -241,7 +265,15 @@ mod tests {
                 at: now(),
             },
         );
-        let report = run(&slack, &Config::default(), &cache, &clears, now()).unwrap();
+        let report = run(
+            &slack,
+            &Config::default(),
+            &cache,
+            &clears,
+            &State::default(),
+            now(),
+        )
+        .unwrap();
         let lines: Vec<&str> = report.text.lines().collect();
         assert_eq!(
             lines[0],
@@ -251,7 +283,10 @@ mod tests {
             lines[1],
             "to:me after:2026-10-10: 0 matches · 0 in list · 0 mine · 0 answered · 0 cleared · 0 ignored · 0 unexplained"
         );
-        assert_eq!(lines[3], "watches: 0 in list / 0 watched");
+        assert_eq!(
+            lines[3],
+            "watches: 0 watched · 0 in list · 0 cleared · 0 unexplained"
+        );
         assert_eq!(lines[4], "  C0INC 1792096200.000100");
         assert_eq!(report.unexplained, 1);
         assert!(!report.text.contains("invented"));
@@ -280,7 +315,15 @@ mod tests {
             ignore_users: vec!["U0BOT".into()],
             ..Config::default()
         };
-        let report = run(&slack, &cfg, &cache, &Clears::default(), now()).unwrap();
+        let report = run(
+            &slack,
+            &cfg,
+            &cache,
+            &Clears::default(),
+            &State::default(),
+            now(),
+        )
+        .unwrap();
         let lines: Vec<&str> = report.text.lines().collect();
         assert!(lines[0].contains(
             "2 matches · 0 in list · 0 mine · 1 answered · 0 cleared · 1 ignored · 0 unexplained"
@@ -301,8 +344,125 @@ mod tests {
             &Config::default(),
             &Cache::default(),
             &Clears::default(),
+            &State::default(),
             now(),
         );
         assert!(err.is_err());
+    }
+
+    const DM_TS: &str = "1792096028.000100";
+
+    fn dm_report(history: &str, clears: &Clears) -> Report {
+        let dm = hit("D0DANA", DM_TS, "U0DANA", None);
+        let slack = fake(&[], &[dm]).on(
+            "conversations.history",
+            &[("channel", "D0DANA")],
+            Ok(history),
+        );
+        run(
+            &slack,
+            &Config::default(),
+            &Cache::default(),
+            clears,
+            &State::default(),
+            now(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn verify_dm_history_answered() {
+        let later = r#"{"ok":true,"messages":[{"ts":"1792096090.000100","user":"U0ME"}]}"#;
+        let report = dm_report(later, &Clears::default());
+        assert!(
+            report
+                .text
+                .lines()
+                .nth(1)
+                .unwrap()
+                .contains("1 answered · 0 cleared · 0 ignored · 0 unexplained")
+        );
+        assert_eq!(report.unexplained, 0);
+    }
+
+    #[test]
+    fn verify_dm_history_without_my_reply_is_unexplained() {
+        let none = r#"{"ok":true,"messages":[{"ts":"1792096090.000100","user":"U0DANA"}]}"#;
+        let report = dm_report(none, &Clears::default());
+        assert!(
+            report
+                .text
+                .lines()
+                .nth(1)
+                .unwrap()
+                .contains("0 answered · 0 cleared · 0 ignored · 1 unexplained")
+        );
+        assert_eq!(report.unexplained, 1);
+        assert!(report.text.ends_with(&format!("  D0DANA {DM_TS}")));
+    }
+
+    #[test]
+    fn verify_dm_clear_covers_top_level_match() {
+        let mut clears = Clears::default();
+        clears.entries.insert(
+            RowKey::dm("D0DANA"),
+            Clear {
+                wm: Ts(DM_TS.into()),
+                keep_watch: false,
+                at: now(),
+            },
+        );
+        let report = dm_report(r#"{"ok":true,"messages":[]}"#, &clears);
+        assert!(
+            report
+                .text
+                .lines()
+                .nth(1)
+                .unwrap()
+                .contains("0 answered · 1 cleared")
+        );
+        assert_eq!(report.unexplained, 0);
+    }
+
+    #[test]
+    fn verify_watches_line() {
+        let msg = |channel: &str, ts: &str| {
+            parse_search_match(&hit(channel, ts, "U0DANA", None)).unwrap()
+        };
+        let listed = msg("C0CORE", "1792096026.000100");
+        let gone = msg("C0CORE", "1792096027.000100");
+        let lost = msg("C0INC", "1792096028.000100");
+        let state = State {
+            watch: WatchState {
+                baseline: Some(Default::default()),
+                watched: [&listed, &gone, &lost]
+                    .into_iter()
+                    .map(|m| (crate::model::msg_id(&m.channel, &m.ts), m.clone()))
+                    .collect(),
+            },
+            ..State::default()
+        };
+        let mut cache = Cache::default();
+        cache
+            .rows
+            .push(row_for(&hit("C0CORE", "1792096026.000100", "U0DANA", None)));
+        let mut clears = Clears::default();
+        clears.entries.insert(
+            RowKey::thread("C0CORE", &gone.ts),
+            Clear {
+                wm: gone.ts.clone(),
+                keep_watch: false,
+                at: now(),
+            },
+        );
+        let slack = fake(&[], &[]);
+        let report = run(&slack, &Config::default(), &cache, &clears, &state, now()).unwrap();
+        let lines: Vec<&str> = report.text.lines().collect();
+        assert_eq!(
+            lines[3],
+            "watches: 3 watched · 1 in list · 1 cleared · 1 unexplained"
+        );
+        assert_eq!(lines[4], "  C0INC 1792096028.000100");
+        assert_eq!(report.unexplained, 1);
     }
 }

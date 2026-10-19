@@ -36,7 +36,7 @@ use crate::fetch::{FetchEvent, FetchRequest, Poller};
 use crate::model::Row;
 use crate::refresh::describe;
 use crate::slack::{HttpSlack, Slack, SlackError};
-use crate::state::{CACHE, CLEARS, Cache, Clear, Clears, Me};
+use crate::state::{CACHE, CLEARS, Cache, Clear, Clears, Me, STATE, State};
 use crate::store::StateDir;
 
 const USAGE: &str = "usage: herdr-slack [verify] [--fixtures]";
@@ -106,8 +106,9 @@ fn run_verify() -> Result<(), String> {
     let state = StateDir::default_location();
     let cache: Cache = state.load(CACHE).map_err(|e| format!("{CACHE}: {e}"))?;
     let clears: Clears = state.load(CLEARS).map_err(|e| format!("{CLEARS}: {e}"))?;
+    let watch: State = state.load(STATE).map_err(|e| format!("{STATE}: {e}"))?;
     let report =
-        verify::run(&slack, &cfg, &cache, &clears, Utc::now()).map_err(|e| describe(&e))?;
+        verify::run(&slack, &cfg, &cache, &clears, &watch, Utc::now()).map_err(|e| describe(&e))?;
     println!("{}", report.text);
     match report.unexplained {
         0 => Ok(()),
