@@ -1,6 +1,6 @@
 //! Opening a row in Slack (spec §4 "Not yet verified" for the URL, §9 "Opening").
 
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use crate::model::{Row, Ts};
 use crate::slack::{Slack, SlackError};
@@ -42,7 +42,7 @@ pub fn launch(url: &str) -> Result<(), String> {
     } else {
         "xdg-open"
     };
-    let mut child = Command::new(opener)
+    let mut child = crate::token::command(opener)
         .arg(url)
         .stdin(Stdio::null())
         .stdout(Stdio::null())

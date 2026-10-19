@@ -44,6 +44,8 @@ pub fn search(s: &dyn Slack, query: &str) -> Result<Searched, SlackError> {
             &[
                 ("query", query.to_owned()),
                 ("count", "100".into()),
+                ("sort", "timestamp".into()),
+                ("sort_dir", "desc".into()),
                 ("page", page.to_string()),
             ],
         )?;
@@ -341,6 +343,9 @@ mod tests {
         assert!(calls[0].1.contains(&("page".into(), "1".into())));
         assert!(calls[0].1.contains(&("query".into(), "<@U0ME>".into())));
         assert!(calls[0].1.contains(&("count".into(), "100".into())));
+        // Newest first by time, so paging is stable while new matches arrive.
+        assert!(calls[0].1.contains(&("sort".into(), "timestamp".into())));
+        assert!(calls[0].1.contains(&("sort_dir".into(), "desc".into())));
         assert!(calls[1].1.contains(&("page".into(), "2".into())));
         assert_eq!(got.msgs.len(), 3);
         assert_eq!(got.total, 3);

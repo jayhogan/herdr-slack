@@ -30,7 +30,7 @@ use crossterm::event::{self, Event, KeyEventKind};
 use ratatui::DefaultTerminal;
 use serde_json::Value;
 
-use crate::app::{Action, App, UndoEntry};
+use crate::app::{Action, App, Body, UndoEntry};
 use crate::config::{Config, OpenMode};
 use crate::fetch::{FetchEvent, FetchRequest, Poller};
 use crate::model::Row;
@@ -134,7 +134,7 @@ fn run_tui(fixtures_mode: bool) -> Result<(), String> {
         fixtures(cfg.clone(), Utc::now())
     } else {
         let mut app = App::new(cfg.clone());
-        let mode = connect(&mut app, &cfg);
+        let mode = connect(&mut app, &cfg, &token::read);
         (app, mode)
     };
     if let Some(e) = cfg_err {
@@ -155,9 +155,9 @@ fn fixtures(cfg: Config, now: DateTime<Utc>) -> (App, Mode) {
     (app, Mode::Fixtures(me))
 }
 
-/// Starts the worker when there is a token; otherwise shows the auth banner.
-fn connect(app: &mut App, cfg: &Config) -> Mode {
-    match token::read() {
+/// Starts the worker when there is a token (from `read_token`); otherwise shows the auth banner.
+fn connect(app: &mut App, cfg: &Config, read_token: &dyn Fn() -> Result<String, String>) -> Mode {
+    match read_token() {
         Ok(token) => Mode::Live(Box::new(Live::start(token, cfg, app))),
         Err(e) => {
             app.set_auth_error(e);
@@ -274,10 +274,25 @@ impl Live {
 
 /// Carries out a key's action; true when the app should quit.
 fn dispatch(app: &mut App, action: Action, mode: &mut Mode, cfg: &Config) -> bool {
-    if action == Action::Refresh && matches!(mode, Mode::NoToken) {
-        *mode = connect(app, cfg);
-        if matches!(mode, Mode::NoToken) {
-            app.set_status(NO_TOKEN.into());
+    dispatch_with(app, action, mode, cfg, &token::read)
+}
+
+fn dispatch_with(
+    app: &mut App,
+    action: Action,
+    mode: &mut Mode,
+    cfg: &Config,
+    read_token: &dyn Fn() -> Result<String, String>,
+) -> bool {
+    // No token, or Slack rejected it: `r` reads the token again before retrying.
+    let auth_failed = matches!(app.screen(Utc::now()).body, Body::AuthError(_));
+    let live = matches!(mode, Mode::Live(_));
+    if action == Action::Refresh && (matches!(mode, Mode::NoToken) || (live && auth_failed)) {
+        *mode = connect(app, cfg, read_token);
+        match mode {
+            Mode::NoToken => app.set_status(NO_TOKEN.into()),
+            Mode::Live(live) => live.refresh(),
+            Mode::Fixtures(_) => {}
         }
         return false;
     }
@@ -488,7 +503,6 @@ fn drain(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::Body;
     use crate::fixtures::sample_cache;
     use crate::model::Kind;
     use crate::slack::fake::FakeSlack;
@@ -880,6 +894,47 @@ mod tests {
         assert_eq!(status(&a).as_deref(), Some(stopped));
         a.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE), now());
         assert_eq!(status(&a).as_deref(), Some(stopped));
+    }
+
+    /// After an auth error, `r` reads the token again instead of retrying the old one.
+    #[test]
+    fn refresh_after_auth_error_rereads_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (requests, worker_rx) = std::sync::mpsc::channel();
+        let (_worker_tx, events) = std::sync::mpsc::channel::<FetchEvent>();
+        let live = Live {
+            requests,
+            events,
+            poller: Poller::new(Instant::now(), Duration::from_secs(180)),
+            state: StateDir::new(tmp.path().to_path_buf()),
+            slack_ui: HttpSlack::new("xoxp-old".into(), false),
+            next_clears_reload: Instant::now(),
+            cache_seen: None,
+            me: None,
+        };
+        let cfg = Config::default();
+        let mut a = App::new(cfg.clone());
+        a.set_cache(Cache {
+            error: Some(SlackError::Auth("token_revoked".into())),
+            ..Cache::default()
+        });
+        let mut mode = Mode::Live(Box::new(live));
+        let read = RefCell::new(0);
+        let no_token = || {
+            *read.borrow_mut() += 1;
+            Err(token::MISSING_TOKEN.to_string())
+        };
+        assert!(!dispatch_with(
+            &mut a,
+            Action::Refresh,
+            &mut mode,
+            &cfg,
+            &no_token
+        ));
+        assert_eq!(*read.borrow(), 1);
+        assert!(matches!(mode, Mode::NoToken));
+        assert!(worker_rx.try_recv().is_err(), "old token not retried");
+        assert!(matches!(a.screen(now()).body, Body::AuthError(_)));
     }
 
     #[test]

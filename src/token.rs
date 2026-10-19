@@ -6,16 +6,25 @@ use std::process::Command;
 /// Shown as the auth banner (spec §9) and as the error when no token is found.
 pub const MISSING_TOKEN: &str = "Slack token missing or invalid. Add it with: security add-generic-password -s herdr-slack -a \"$USER\" -w";
 
+const TOKEN_ENV: &str = "HERDR_SLACK_TOKEN";
+
 /// Keychain first (macOS), then `HERDR_SLACK_TOKEN`. The token is never written or logged.
 pub fn read() -> Result<String, String> {
-    pick(keychain(), env::var("HERDR_SLACK_TOKEN").ok())
+    pick(keychain(), env::var(TOKEN_ENV).ok())
+}
+
+/// A child process that doesn't inherit the token from our environment.
+pub fn command(program: &str) -> Command {
+    let mut cmd = Command::new(program);
+    cmd.env_remove(TOKEN_ENV);
+    cmd
 }
 
 fn keychain() -> Option<String> {
     if !cfg!(target_os = "macos") {
         return None;
     }
-    let out = Command::new("security")
+    let out = command("security")
         .args(["find-generic-password", "-s", "herdr-slack", "-w"])
         .output()
         .ok()?;
@@ -39,6 +48,13 @@ mod tests {
 
     fn s(v: &str) -> Option<String> {
         Some(v.to_string())
+    }
+
+    #[test]
+    fn child_processes_never_get_the_token() {
+        let cmd = command("open");
+        let removed = cmd.get_envs().any(|(k, v)| k == TOKEN_ENV && v.is_none());
+        assert!(removed);
     }
 
     #[test]

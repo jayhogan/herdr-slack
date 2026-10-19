@@ -68,7 +68,10 @@ fn retry_wait(done: u32, max: u32, header: Option<&str>) -> Option<Duration> {
 }
 
 fn is_tier2(method: &str) -> bool {
-    matches!(method, "search.messages" | "reactions.list")
+    matches!(
+        method,
+        "search.messages" | "reactions.list" | "conversations.list"
+    )
 }
 
 pub struct HttpSlack {
@@ -294,6 +297,7 @@ mod tests {
     fn tiers() {
         assert!(is_tier2("search.messages"));
         assert!(is_tier2("reactions.list"));
+        assert!(is_tier2("conversations.list"));
         assert!(!is_tier2("reactions.get"));
         assert!(!is_tier2("conversations.history"));
     }
