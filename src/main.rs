@@ -221,7 +221,7 @@ impl Live {
             events,
             poller: Poller::new(now, Duration::from_secs(cfg.refresh_secs)),
             state,
-            slack_ui: HttpSlack::new(token, false),
+            slack_ui: HttpSlack::new(token, false).with_retries(0),
             next_clears_reload: now,
             cache_seen,
             me,
@@ -451,11 +451,30 @@ fn event_loop(
             && key.kind == KeyEventKind::Press
         {
             let action = app.handle_key(key, Utc::now());
+            let blocking = matches!(
+                action,
+                Action::Open { .. } | Action::Clear { .. } | Action::Undo(_)
+            );
             if dispatch(app, action, mode, cfg) {
                 return Ok(());
             }
+            if blocking {
+                drain(|| event::poll(Duration::ZERO), event::read)?;
+            }
         }
     }
+}
+
+/// Drops input queued while a blocking Slack call ran, so a repeated `x` can't clear the
+/// next, unread row.
+fn drain(
+    mut poll: impl FnMut() -> io::Result<bool>,
+    mut read: impl FnMut() -> io::Result<Event>,
+) -> io::Result<()> {
+    while poll()? {
+        read()?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -814,6 +833,20 @@ mod tests {
             .unwrap();
         assert!(sync_cache(&state, &mut seen, &mut a, &mut me_seen));
         assert_eq!(a.rows().len(), 2);
+    }
+
+    /// F5: keys pressed while a blocking Slack call ran are dropped, not replayed onto the
+    /// next row.
+    #[test]
+    fn drain_discards_queued_keys() {
+        let x = Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        let queue = RefCell::new(vec![x.clone(), x]);
+        drain(
+            || Ok(!queue.borrow().is_empty()),
+            || Ok(queue.borrow_mut().pop().unwrap()),
+        )
+        .unwrap();
+        assert!(queue.borrow().is_empty());
     }
 
     #[test]

@@ -34,6 +34,8 @@ const AUTH_CODES: [&str; 4] = [
 const TIER2_GAP: Duration = Duration::from_secs(4);
 const OTHER_GAP: Duration = Duration::from_millis(1500);
 const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(30);
+/// A longer Retry-After is waited out in pieces of this, retry by retry.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
 const MAX_RETRIES: u32 = 3;
 
 /// Maps a Slack response body to `Ok(body)` or the matching error.
@@ -59,6 +61,12 @@ pub fn retry_after(header: Option<&str>) -> Duration {
         .map_or(DEFAULT_RETRY_AFTER, Duration::from_secs)
 }
 
+/// How long to sleep before retry `done + 1` after a 429, at most 60 s; None when `max`
+/// retries are used up.
+fn retry_wait(done: u32, max: u32, header: Option<&str>) -> Option<Duration> {
+    (done < max).then(|| retry_after(header).min(MAX_RETRY_AFTER))
+}
+
 fn is_tier2(method: &str) -> bool {
     matches!(method, "search.messages" | "reactions.list")
 }
@@ -67,6 +75,8 @@ pub struct HttpSlack {
     token: String,
     agent: ureq::Agent,
     paced: bool,
+    /// 429 retries per call.
+    retries: u32,
     /// Last call time for (tier 2, every other method).
     last: RefCell<(Option<Instant>, Option<Instant>)>,
 }
@@ -82,8 +92,15 @@ impl HttpSlack {
             token,
             agent: config.into(),
             paced,
+            retries: MAX_RETRIES,
             last: RefCell::new((None, None)),
         }
+    }
+
+    /// The UI's client uses 0: a key press must not wait out a rate limit.
+    pub fn with_retries(mut self, retries: u32) -> HttpSlack {
+        self.retries = retries;
+        self
     }
 
     fn pace(&self, method: &str) {
@@ -122,15 +139,15 @@ impl Slack for HttpSlack {
                 .map_err(|e| SlackError::Http(format!("{method}: {e}")))?;
             let status = resp.status().as_u16();
             if status == 429 {
-                if retries == MAX_RETRIES {
-                    return Err(SlackError::RateLimited(method.to_owned()));
-                }
-                retries += 1;
                 let header = resp
                     .headers()
                     .get("retry-after")
                     .and_then(|v| v.to_str().ok());
-                thread::sleep(retry_after(header));
+                let Some(wait) = retry_wait(retries, self.retries, header) else {
+                    return Err(SlackError::RateLimited(method.to_owned()));
+                };
+                retries += 1;
+                thread::sleep(wait);
                 continue;
             }
             if status >= 300 {
@@ -254,6 +271,23 @@ mod tests {
         assert_eq!(retry_after(Some(" 12 ")), Duration::from_secs(12));
         assert_eq!(retry_after(None), Duration::from_secs(30));
         assert_eq!(retry_after(Some("soon")), Duration::from_secs(30));
+    }
+
+    /// F5: Retry-After sleeps are clamped to 60 s, and a client with no retries (the UI's)
+    /// fails a 429 at once.
+    #[test]
+    fn retry_wait_clamps_and_respects_retries() {
+        assert_eq!(retry_wait(0, 3, Some("7")), Some(Duration::from_secs(7)));
+        assert_eq!(retry_wait(0, 3, Some("600")), Some(Duration::from_secs(60)));
+        assert_eq!(retry_wait(2, 3, None), Some(Duration::from_secs(30)));
+        assert_eq!(retry_wait(3, 3, Some("1")), None);
+        assert_eq!(retry_wait(0, 0, Some("1")), None);
+        let ui = HttpSlack::new("xoxp-test".into(), false).with_retries(0);
+        assert_eq!(ui.retries, 0);
+        assert_eq!(
+            HttpSlack::new("xoxp-test".into(), true).retries,
+            MAX_RETRIES
+        );
     }
 
     #[test]
