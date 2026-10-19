@@ -25,10 +25,11 @@ pub enum Action {
     None,
     Quit,
     Refresh,
-    /// `clear` is `Some` for `O`.
+    /// `clear` is `Some` for `O`; `unwatch` when that clear drops a watch (`open_clears_watch`).
     Open {
         row: Row,
         clear: Option<Clear>,
+        unwatch: bool,
     },
     /// `x`; `unwatch` when the row has Watch (remove the reaction in Slack).
     Clear {
@@ -196,19 +197,27 @@ impl App {
             KeyCode::Char('q') | KeyCode::Esc => return Action::Quit,
             KeyCode::Char('o') => {
                 if let Some(row) = self.selected_row() {
-                    return Action::Open { row, clear: None };
+                    return Action::Open {
+                        row,
+                        clear: None,
+                        unwatch: false,
+                    };
                 }
             }
             KeyCode::Char('O') => {
                 if let Some(row) = self.selected_row() {
-                    let keep_watch =
-                        row.kinds.contains(&Kind::Watch) && !self.cfg.open_clears_watch;
+                    let has_watch = row.kinds.contains(&Kind::Watch);
+                    let keep_watch = has_watch && !self.cfg.open_clears_watch;
                     let clear = Some(Clear {
                         wm: row.newest.clone(),
                         keep_watch,
                         at: now,
                     });
-                    return Action::Open { row, clear };
+                    return Action::Open {
+                        row,
+                        clear,
+                        unwatch: has_watch && !keep_watch,
+                    };
                 }
             }
             KeyCode::Char('x') => {
@@ -246,27 +255,23 @@ impl App {
                 row,
                 clear,
                 unwatch,
+            }
+            | Action::Open {
+                row,
+                clear: Some(clear),
+                unwatch,
             } => {
                 let rewatch = unwatch
                     .then(|| row.watched.clone().map(|ts| (row.channel.clone(), ts)))
                     .flatten();
                 let status = if *unwatch {
                     "Cleared · :eyes: removed · u to undo"
-                } else {
-                    "Cleared · u to undo"
-                };
-                self.record_clear(row, clear, rewatch, status);
-            }
-            Action::Open {
-                row,
-                clear: Some(clear),
-            } => {
-                let status = if clear.keep_watch {
+                } else if matches!(action, Action::Open { .. }) && clear.keep_watch {
                     "Opened · watch kept"
                 } else {
                     "Cleared · u to undo"
                 };
-                self.record_clear(row, clear, None, status);
+                self.record_clear(row, clear, rewatch, status);
             }
             Action::Undo(entry) => {
                 self.keep_selection(|a| {
@@ -534,6 +539,61 @@ mod tests {
         assert_eq!(a.status.as_deref(), Some("Restored · :eyes: re-added"));
         assert_eq!(a.handle_key(key('u'), now()), Action::None);
         assert_eq!(a.status.as_deref(), Some("Nothing to undo"));
+    }
+
+    #[test]
+    fn big_o_applied_keeps_watch_row_visible() {
+        let mut a = app();
+        select(&mut a, Kind::Watch, 1); // b: watch, mention, thread
+        let before = a.rows().len();
+        let act = a.handle_key(key('O'), now());
+        a.applied(&act, Ok(()));
+        let rows = a.rows();
+        assert_eq!(rows.len(), before);
+        assert_eq!(rows[a.sel].kinds, vec![Kind::Watch]);
+        assert_eq!(a.status.as_deref(), Some("Opened · watch kept"));
+        assert_eq!(a.undo.last().unwrap().rewatch, None);
+    }
+
+    #[test]
+    fn big_o_applied_hides_non_watch_row_and_undo_restores() {
+        let mut a = app();
+        select(&mut a, Kind::Dm, 0);
+        let before = a.rows();
+        let act = a.handle_key(key('O'), now());
+        assert!(matches!(act, Action::Open { unwatch: false, .. }));
+        a.applied(&act, Ok(()));
+        assert_eq!(a.rows().len(), before.len() - 1);
+        assert_eq!(a.status.as_deref(), Some("Cleared · u to undo"));
+        do_key(&mut a, 'u');
+        assert_eq!(a.rows(), before);
+        assert_eq!(a.status.as_deref(), Some("Restored"));
+    }
+
+    #[test]
+    fn big_o_with_open_clears_watch_unwatches() {
+        let cfg = Config {
+            open_clears_watch: true,
+            ..Config::default()
+        };
+        let mut a = app_with(cfg);
+        select(&mut a, Kind::Watch, 0);
+        let before = a.rows().len();
+        let act = a.handle_key(key('O'), now());
+        let Action::Open { row, unwatch, .. } = &act else {
+            panic!("{act:?}")
+        };
+        assert!(*unwatch);
+        let expect = Some((row.channel.clone(), row.watched.clone().unwrap()));
+        a.applied(&act, Ok(()));
+        assert_eq!(a.rows().len(), before - 1);
+        assert_eq!(a.undo.last().unwrap().rewatch, expect);
+        assert_eq!(
+            a.status.as_deref(),
+            Some("Cleared · :eyes: removed · u to undo")
+        );
+        do_key(&mut a, 'u');
+        assert_eq!(a.status.as_deref(), Some("Restored · :eyes: re-added"));
     }
 
     #[test]
