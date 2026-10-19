@@ -12,6 +12,8 @@ mod model;
 #[cfg(test)]
 mod slack;
 #[cfg(test)]
+mod sources;
+#[cfg(test)]
 mod state;
 #[cfg(test)]
 mod store;

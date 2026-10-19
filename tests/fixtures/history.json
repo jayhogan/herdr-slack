@@ -1,0 +1,3 @@
+{"ok":true,"has_more":true,"response_metadata":{"next_cursor":"CUR2"},"messages":[
+{"type":"message","user":"U0AVA","text":"top level one","ts":"1792096300.000500"},
+{"type":"message","user":"U0NORA","text":"a reply in a thread","ts":"1792096250.000400","thread_ts":"1792096100.000100"}]}
