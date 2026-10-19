@@ -12,6 +12,8 @@ mod config;
 #[cfg(test)]
 mod model;
 #[cfg(test)]
+mod refresh;
+#[cfg(test)]
 mod slack;
 #[cfg(test)]
 mod sources;

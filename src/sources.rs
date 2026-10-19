@@ -169,30 +169,46 @@ pub fn history(s: &dyn Slack, channel: &str, oldest: &Ts) -> Result<Vec<Msg>, Sl
     Ok(msgs)
 }
 
-/// Ids of the group DMs `me` is in.
-pub fn mpims(s: &dyn Slack) -> Result<Vec<String>, SlackError> {
-    let mut ids = Vec::new();
+/// Every `(id, name)` from a cursor-paged channel listing (`users.conversations`,
+/// `conversations.list`) of `types`, archived excluded.
+fn channel_list(
+    s: &dyn Slack,
+    method: &str,
+    types: &str,
+) -> Result<Vec<(String, String)>, SlackError> {
+    let mut out = Vec::new();
     let mut cursor = String::new();
     loop {
         let mut p = vec![
-            ("types", "mpim".to_owned()),
+            ("types", types.to_owned()),
             ("exclude_archived", "true".into()),
             ("limit", "200".into()),
         ];
         if !cursor.is_empty() {
             p.push(("cursor", cursor.clone()));
         }
-        let body = s.call("users.conversations", &p)?;
+        let body = s.call(method, &p)?;
         let page = body["channels"].as_array().map_or(&[][..], Vec::as_slice);
-        ids.extend(
-            page.iter()
-                .filter_map(|c| c["id"].as_str().map(str::to_owned)),
-        );
+        out.extend(page.iter().filter_map(|c| {
+            let name = c["name"].as_str().unwrap_or("");
+            Some((c["id"].as_str()?.to_owned(), name.to_owned()))
+        }));
         cursor = next_cursor(&body);
         if cursor.is_empty() {
-            return Ok(ids);
+            return Ok(out);
         }
     }
+}
+
+/// Ids of the group DMs `me` is in.
+pub fn mpims(s: &dyn Slack) -> Result<Vec<String>, SlackError> {
+    let list = channel_list(s, "users.conversations", "mpim")?;
+    Ok(list.into_iter().map(|(id, _)| id).collect())
+}
+
+/// `(id, name)` of every public and private channel visible to the token.
+pub fn channels(s: &dyn Slack) -> Result<Vec<(String, String)>, SlackError> {
+    channel_list(s, "conversations.list", "public_channel,private_channel")
 }
 
 /// Display name, else real name, else handle.
