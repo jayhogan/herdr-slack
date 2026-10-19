@@ -4,6 +4,13 @@
 #[cfg(test)]
 mod ago;
 
+// Compiled for tests only until Task 3+ wires a caller.
+#[cfg(test)]
+mod model;
+// Compiled for tests only until Task 3+ wires a caller.
+#[cfg(test)]
+mod text;
+
 use std::env;
 use std::process::ExitCode;
 

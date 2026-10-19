@@ -1,0 +1,9 @@
+{
+  "type": "message",
+  "bot_id": "B0ALERT",
+  "ts": "1792096100.000200",
+  "text": "",
+  "attachments": [
+    { "fallback": "[core-api] Error rate high", "title": "Error rate high", "text": "5xx rate is 4% on core-api" }
+  ]
+}

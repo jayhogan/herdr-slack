@@ -1,0 +1,11 @@
+{
+  "type": "message",
+  "user": "U0DANA",
+  "ts": "1792096026.762699",
+  "text": "",
+  "blocks": [
+    { "type": "header", "text": { "type": "plain_text", "text": "Deploy blocked: core-api" } },
+    { "type": "section", "text": { "type": "mrkdwn", "text": "Needs a decision from <@U0ME> before the freeze." } },
+    { "type": "context", "elements": [ { "type": "mrkdwn", "text": "Posted by Release Bot" } ] }
+  ]
+}
