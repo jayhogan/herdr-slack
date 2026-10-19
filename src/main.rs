@@ -250,9 +250,10 @@ impl Live {
                     if cache.me.is_some() {
                         self.me = cache.me.clone();
                     }
+                    let since = fetch::since_attempt(&cache, Utc::now());
                     app.set_cache(cache);
                     app.set_loading(false);
-                    self.poller.on_done(Instant::now());
+                    self.poller.on_done(Instant::now(), since);
                 }
             }
         }

@@ -107,7 +107,8 @@ pub fn run(
     let mut dm_channels: BTreeSet<String> = state.mpims.iter().cloned().collect();
     dm_channels.extend(dm_rows.iter().cloned());
     dm_channels.extend(all_hits.map(|m| m.channel.clone()).filter(|c| is_im(c)));
-    let (slice, cursor) = mpim_slice(&state.mpims, state.mpim_cursor, cfg.refresh_secs);
+    let elapsed = state.last_refresh_at.map(|t| (now - t).num_seconds());
+    let (slice, cursor) = mpim_slice(&state.mpims, state.mpim_cursor, elapsed);
     state.mpim_cursor = cursor;
     let mut dm_reads: BTreeSet<String> = to_me
         .iter()
@@ -165,6 +166,9 @@ pub fn run(
         };
         Some((id, ts.clone()))
     });
+    // Watched threads never expire while watched: they stay known, on the quiet schedule.
+    let watched_threads: BTreeSet<String> =
+        watch_rows(&state.watch).into_iter().map(|k| k.0).collect();
     // Within one quiet cycle of expiry, read every refresh: expiry needs a fresh read (§7).
     let cycle = Duration::seconds((QUIET_EVERY * cfg.refresh_secs) as i64);
     let near_expiry = unix(now - Duration::days(KNOWN_THREAD_DAYS) + cycle);
@@ -174,7 +178,8 @@ pub fn run(
             .get(&id)
             .map_or(last.clone(), |h| h.clone().max(last));
         let key = msg_id(&id.channel, &id.root);
-        let d = last <= near_expiry || thread_due(&key, &last, state.refresh_no, now);
+        let expiring = last <= near_expiry && !watched_threads.contains(&key);
+        let d = expiring || thread_due(&key, &last, state.refresh_no, now);
         due.insert(id, d);
     }
     for id in hinted.keys() {
@@ -227,7 +232,7 @@ pub fn run(
         .collect();
     state
         .known_threads
-        .retain(|key, ts| *ts >= expiry || !read_ok.contains(key));
+        .retain(|key, ts| *ts >= expiry || !read_ok.contains(key) || watched_threads.contains(key));
 
     let watched_rows = watch_rows(&state.watch);
     clears
@@ -240,6 +245,7 @@ pub fn run(
     }
     state.version = VERSION;
     state.refresh_no += 1;
+    state.last_refresh_at = Some(now);
     Ok(Cache {
         version: VERSION,
         fetched_at: Some(now),
@@ -303,13 +309,21 @@ pub fn thread_due(id: &str, last_activity: &Ts, refresh_no: u64, now: DateTime<U
 }
 
 /// The group DMs to read this refresh, so every one is read within ~10 minutes:
-/// `ceil(len / k)` ids from `cursor` (wrapping), `k = max(1, 600 / refresh_secs)`.
-pub fn mpim_slice(all: &[String], cursor: usize, refresh_secs: u64) -> (Vec<String>, usize) {
+/// `ceil(len × elapsed / 600)` ids from `cursor` (wrapping), at least 1, at most all; all of
+/// them when `elapsed` (seconds since the last refresh started) is unknown.
+pub fn mpim_slice(all: &[String], cursor: usize, elapsed: Option<i64>) -> (Vec<String>, usize) {
     if all.is_empty() {
         return (Vec::new(), 0);
     }
-    let k = (MPIM_WINDOW_SECS / refresh_secs.max(1)).max(1) as usize;
-    let n = all.len().div_ceil(k);
+    let len = all.len();
+    let n = match elapsed {
+        None => len,
+        Some(secs) => {
+            let secs = u64::try_from(secs).unwrap_or(0);
+            let share = (len as u64).saturating_mul(secs).div_ceil(MPIM_WINDOW_SECS);
+            usize::try_from(share).unwrap_or(len).clamp(1, len)
+        }
+    };
     let start = cursor % all.len();
     let ids = (0..n)
         .map(|i| all[(start + i) % all.len()].clone())
@@ -1097,12 +1111,10 @@ mod tests {
         let mut state = State {
             mpims: vec!["G0STALE".into()],
             mpims_listed_at: Some(now() - Duration::hours(7)),
+            last_refresh_at: Some(now() - Duration::seconds(300)), // half of the 10 min
             ..seeded()
         };
-        let cfg = Config {
-            refresh_secs: 300, // k = 2: one of the two group DMs per refresh
-            ..Config::default()
-        };
+        let cfg = Config::default();
         let listed = r#"{"ok":true,"channels":[{"id":"G0MPDM1"},{"id":"G0MPDM2"}]}"#;
         let history_of = |fake: &FakeSlack| -> Vec<String> {
             calls(fake, "conversations.history")
@@ -1121,6 +1133,7 @@ mod tests {
         assert_eq!(state.mpim_cursor, 1);
         assert_eq!(history_of(&first), ["G0MPDM1"]);
         let second = base();
+        state.last_refresh_at = Some(now() - Duration::seconds(300));
         run_with(&second, &cfg, &mut state, &Cache::default());
         assert!(calls(&second, "users.conversations").is_empty());
         assert_eq!(state.mpim_cursor, 0);
@@ -1240,21 +1253,68 @@ mod tests {
         }
     }
 
+    /// F3: the slice is sized by the real time since the last refresh, so a slow refresh
+    /// cycle still reads every group DM within ~10 minutes.
     #[test]
     fn mpim_slice_covers_all_in_window() {
         let all: Vec<String> = (0..160).map(|i| format!("G0MP{i:03}")).collect();
         let mut cursor = 0;
         let mut seen = BTreeSet::new();
         for _ in 0..3 {
-            let (ids, next) = mpim_slice(&all, cursor, 180);
+            let (ids, next) = mpim_slice(&all, cursor, Some(200));
             assert_eq!(ids.len(), 54);
             seen.extend(ids);
             cursor = next;
         }
         assert_eq!(seen.len(), 160);
-        assert_eq!(mpim_slice(&[], 4, 180), (vec![], 0));
-        let one = vec!["G0MPDM1".to_string()];
-        assert_eq!(mpim_slice(&one, 0, 900), (one.clone(), 0));
+        // A 6.5-minute cycle reads ceil(160 * 390 / 600) = 104.
+        assert_eq!(mpim_slice(&all, 0, Some(390)).0.len(), 104);
+        // First run, or a long gap: all of them. At least one, always.
+        assert_eq!(mpim_slice(&all, 7, None).0.len(), 160);
+        let (ids, next) = mpim_slice(&all, 7, Some(5000));
+        assert_eq!((ids.len(), next), (160, 7));
+        assert_eq!(mpim_slice(&all, 0, Some(0)).0.len(), 1);
+        assert_eq!(mpim_slice(&[], 4, Some(180)), (vec![], 0));
+    }
+
+    /// F3: a watched thread quiet past 14 days stays known and is read on the quiet schedule,
+    /// not every refresh as if it were new.
+    #[test]
+    fn quiet_watched_thread_follows_schedule() {
+        let root_ts = ago(20 * DAY);
+        let key = format!("C0CORE:{root_ts}");
+        let watched = Msg {
+            channel: "C0CORE".into(),
+            ts: Ts(root_ts.clone()),
+            thread_ts: None,
+            reply_count: 0,
+            user: "U0DANA".into(),
+            subtype: None,
+            body: "keep an eye on this".into(),
+        };
+        let mut state = seeded();
+        state.watch.watched.insert(key.clone(), watched.clone());
+        state.known_threads.insert(key.clone(), Ts(root_ts.clone()));
+        let reactions = format!(
+            r#"{{"ok":true,"items":[{{"type":"message","channel":"C0CORE","message":{{"type":"message","ts":"{root_ts}","user":"U0DANA","text":"keep an eye on this","reactions":[{{"name":"eyes","users":["U0ME"]}}]}}}}]}}"#
+        );
+        let thread = messages(&[msg(&root_ts, "U0DANA", "keep an eye on this")]);
+        let mut read_on = Vec::new();
+        for n in 0..QUIET_EVERY {
+            state.refresh_no = n;
+            let fake = base().on("reactions.list", &[], Ok(&reactions)).on(
+                "conversations.replies",
+                &[],
+                Ok(&thread),
+            );
+            let cache = run_with(&fake, &Config::default(), &mut state, &Cache::default());
+            if !calls(&fake, "conversations.replies").is_empty() {
+                read_on.push(n);
+            }
+            assert_eq!(keys(&cache), [key.as_str()]);
+            assert!(state.known_threads.contains_key(&key), "refresh {n}");
+        }
+        assert_eq!(read_on.len(), 1, "read on {read_on:?}");
     }
 
     #[test]

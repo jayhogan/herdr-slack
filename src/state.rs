@@ -45,6 +45,9 @@ pub struct State {
     /// succeeded. `ch:<id>` for curated channels and DMs, `search:<query>` per search query.
     #[serde(default)]
     pub last_ok: BTreeMap<String, Ts>,
+    /// When the last successful refresh started; sizes the group-DM slice.
+    #[serde(default)]
+    pub last_refresh_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -95,6 +98,7 @@ mod tests {
         let state: State = serde_json::from_str(json).unwrap();
         assert_eq!(state.refresh_no, 4);
         assert!(state.last_ok.is_empty());
+        assert_eq!(state.last_refresh_at, None);
     }
 
     #[test]

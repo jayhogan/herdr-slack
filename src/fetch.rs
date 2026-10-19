@@ -5,7 +5,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration as StdDuration, Instant};
 
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 
 use crate::config::Config;
 use crate::refresh;
@@ -51,8 +51,18 @@ pub fn decide(
     }
 }
 
+/// The least gap between a `Done` and the next scheduled request.
+const MIN_AFTER_DONE: StdDuration = StdDuration::from_secs(30);
+
+/// How long ago the refresh behind `cache` started (or failed, for an error cache); None when
+/// unknown. The worker's refresh start is `fetched_at`.
+pub fn since_attempt(cache: &Cache, now: DateTime<Utc>) -> Option<StdDuration> {
+    let at = cache.fetched_at.max(cache.error_at)?;
+    (now - at).to_std().ok()
+}
+
 /// Decides when the main loop sends requests: `Scheduled` at startup, then `every` after the
-/// answer to the last outstanding request.
+/// start of the refresh that answered the last outstanding request, at least 30 s after it.
 pub struct Poller {
     every: StdDuration,
     /// `None` while a scheduled answer is awaited: the next one is timed from its `Done`.
@@ -86,11 +96,12 @@ impl Poller {
         FetchRequest::Forced
     }
 
-    /// Called for every `Done`.
-    pub fn on_done(&mut self, now: Instant) {
+    /// Called for every `Done`, with how long ago its refresh started (`since_attempt`).
+    pub fn on_done(&mut self, now: Instant, since_start: Option<StdDuration>) {
         self.in_flight = self.in_flight.saturating_sub(1);
         if self.in_flight == 0 {
-            self.next_scheduled = Some(now + self.every);
+            let wait = self.every.saturating_sub(since_start.unwrap_or_default());
+            self.next_scheduled = Some(now + wait.max(MIN_AFTER_DONE));
         }
     }
 }
@@ -286,8 +297,10 @@ mod tests {
         assert_eq!(decide(&Scheduled, s(30), true, 20), Plan::Fetch);
     }
 
+    /// F3: the next scheduled request is timed from when the last refresh started, and comes
+    /// at least 30 s after its Done.
     #[test]
-    fn poller_times_from_last_done() {
+    fn poller_times_from_last_start() {
         use FetchRequest::*;
         let s = StdDuration::from_secs;
         let t0 = Instant::now();
@@ -296,17 +309,33 @@ mod tests {
         assert!(p.due(t0 + s(500)).is_empty(), "awaiting its Done");
         assert_eq!(p.forced(), Forced);
         // Two requests out: the first Done does not schedule yet.
-        p.on_done(t0 + s(2));
+        p.on_done(t0 + s(2), Some(s(1)));
         assert!(p.due(t0 + s(500)).is_empty());
-        p.on_done(t0 + s(5));
-        assert!(p.due(t0 + s(184)).is_empty());
-        assert_eq!(p.due(t0 + s(185)), vec![Scheduled]);
-        p.on_done(t0 + s(186));
-        // A forced refresh pushes the schedule out.
-        assert_eq!(p.forced(), Forced);
-        p.on_done(t0 + s(300));
-        assert!(p.due(t0 + s(479)).is_empty());
-        assert_eq!(p.due(t0 + s(480)), vec![Scheduled]);
+        // Done 5 s in, the refresh started 5 s before: due 180 s after its start.
+        p.on_done(t0 + s(5), Some(s(5)));
+        assert!(p.due(t0 + s(179)).is_empty());
+        assert_eq!(p.due(t0 + s(180)), vec![Scheduled]);
+        // A 200 s refresh: 30 s after its Done, not another 180 s.
+        p.on_done(t0 + s(380), Some(s(200)));
+        assert!(p.due(t0 + s(409)).is_empty());
+        assert_eq!(p.due(t0 + s(410)), vec![Scheduled]);
+        // Unknown start: a full interval after Done.
+        p.on_done(t0 + s(420), None);
+        assert!(p.due(t0 + s(599)).is_empty());
+        assert_eq!(p.due(t0 + s(600)), vec![Scheduled]);
+    }
+
+    #[test]
+    fn since_attempt_uses_start_or_failure() {
+        let now = Utc::now();
+        let mut c = Cache {
+            fetched_at: Some(now - Duration::seconds(200)),
+            ..Cache::default()
+        };
+        assert_eq!(since_attempt(&c, now), Some(StdDuration::from_secs(200)));
+        c.error_at = Some(now - Duration::seconds(10));
+        assert_eq!(since_attempt(&c, now), Some(StdDuration::from_secs(10)));
+        assert_eq!(since_attempt(&Cache::default(), now), None);
     }
 
     fn recv(rx: &Receiver<FetchEvent>) -> FetchEvent {
