@@ -131,8 +131,10 @@ until the reaction is gone.
 - Never-miss rules: every search is paged to the end of its window, and a truncation shows in the
   header. A failed source keeps the rows it supplied last time and shows the error. A row leaves
   only when a successful read shows it resolved, or when you clear it. Rows that age out of the
-  lookback window stay until cleared or past retention. Search windows overlap by a day, and
-  per-channel cursors only advance after a successful read.
+  lookback window stay until cleared or past retention. Each search, curated channel and DM
+  remembers when it was last read successfully, and the next read reaches back to 10 minutes
+  before that (never past retention) when that is older than its lookback window, so a closed
+  laptop or a run of failed refreshes leaves no gap. Search windows overlap by one more day.
 - A DM becomes one row keyed by the channel; a DM message with replies or a watch gets its own
   thread row and leaves the DM row.
 - Not covered: threads you follow without having posted in them, Slack's own "Later" list (no API;

@@ -37,32 +37,52 @@ pub fn run(
     let my = me.user_id.as_str();
     let mut warn = Vec::new();
     let mut names = prev.names.clone();
-    let mention_floor = now - Duration::days(cfg.lookback_days.into());
-    let win = Windows {
-        mention_floor: unix(mention_floor),
-        channel_floor: unix(now - Duration::hours(cfg.channel_lookback_hours.into())),
+    let cursors = Cursors {
+        last_ok: state.last_ok.clone(),
+        now,
         retention_floor: unix(now - Duration::days(cfg.retention_days.into())),
     };
-    let after = search_after(cfg, now);
+    let dm_back = Duration::days(cfg.lookback_days.into());
+    let channel_back = Duration::hours(cfg.channel_lookback_hours.into());
+    let mut ok = Vec::new(); // cursors to advance: their reads succeeded
 
     let watched = read_watches(s, my, cfg, &mut state.watch, &mut warn);
 
     let mut mention_hits = BTreeMap::new();
     let mut mention_errs = Vec::new();
+    // Rows older than the floor every mention query covered count as aged out (§7).
+    let mut mention_floor = unix(now - dm_back);
     for query in mention_queries(my, cfg) {
+        let key = format!("search:{query}");
+        let floor = cursors.floor(&key, dm_back);
+        mention_floor = mention_floor.max(floor.clone());
         // A truncated query can't prove a mention resolved: the read counts as failed (§7).
-        let (hits, complete) = search(s, &query, &after, &mut warn).unwrap_or_default();
+        let (hits, complete) = search(s, &query, &floor, &mut warn).unwrap_or_default();
         mention_hits.extend(hits.into_iter().map(|m| (msg_id(&m.channel, &m.ts), m)));
-        if !complete {
+        if complete {
+            ok.push(key);
+        } else {
             mention_errs.push(query);
         }
     }
     let mention_hits: Vec<Msg> = mention_hits.into_values().collect();
     // These only pick what to read (absent reads carry rows), so partial hits are safe to use.
-    let to_me = search(s, "to:me", &after, &mut warn).unwrap_or_default().0;
-    let from_me = search(s, "from:me", &after, &mut warn)
-        .unwrap_or_default()
-        .0;
+    let mut search_other = |query: &str| {
+        let key = format!("search:{query}");
+        let floor = cursors.floor(&key, dm_back);
+        let (hits, complete) = search(s, query, &floor, &mut warn).unwrap_or_default();
+        if complete {
+            ok.push(key);
+        }
+        hits
+    };
+    let to_me = search_other("to:me");
+    let from_me = search_other("from:me");
+    let win = Windows {
+        mention_floor,
+        channel_floor: unix(now - channel_back),
+        retention_floor: cursors.retention_floor.clone(),
+    };
 
     // DMs (before threads, so DM thread roots are read this refresh).
     if state
@@ -98,7 +118,11 @@ pub fn run(
     dm_reads.extend(slice);
     let mut dms = BTreeMap::new();
     for ch in dm_reads {
-        let read = sources::history(s, &ch, &win.mention_floor);
+        let key = format!("ch:{ch}");
+        let read = sources::history(s, &ch, &cursors.floor(&key, dm_back));
+        if read.is_ok() {
+            ok.push(key);
+        }
         let read = keep(read, &mut warn, &label(&names, &ch));
         dms.insert(ch, read);
     }
@@ -163,7 +187,10 @@ pub fn run(
         threads.insert(id, keep(read, &mut warn, &source));
     }
 
-    let channels = read_channels(s, cfg, prev, &mut names, &win, &mut warn);
+    let channels = read_channels(s, cfg, prev, &mut names, &cursors, &mut ok, &mut warn);
+    for key in ok {
+        state.last_ok.insert(key, unix(now));
+    }
 
     let reads = Reads {
         me: my.to_owned(),
@@ -225,11 +252,38 @@ pub fn run(
     })
 }
 
-/// The `after:` filter every search source uses. `after:` is day-granular, exclusive and in the
-/// user's timezone: one more day of overlap keeps the whole window [floor, now] covered (§7).
+/// The `after:` filter for a search window starting at `floor`. `after:` is day-granular,
+/// exclusive and in the user's timezone: one more day of overlap keeps [floor, now] covered (§7).
+fn after_filter(floor: &Ts) -> String {
+    sources::after(floor.to_utc() - Duration::days(1))
+}
+
+/// The `after:` filter for the full lookback window (`verify`).
 pub(crate) fn search_after(cfg: &Config, now: DateTime<Utc>) -> String {
-    let mention_floor = now - Duration::days(cfg.lookback_days.into());
-    sources::after(mention_floor - Duration::days(1))
+    after_filter(&unix(now - Duration::days(cfg.lookback_days.into())))
+}
+
+/// Overlap kept before a source's last successful read (§7 "Overlap").
+const CURSOR_OVERLAP_MINS: i64 = 10;
+
+/// Per-source read cursors as they stood when this refresh started.
+struct Cursors {
+    last_ok: BTreeMap<String, Ts>,
+    now: DateTime<Utc>,
+    retention_floor: Ts,
+}
+
+impl Cursors {
+    /// Where a read of `source` starts: the lookback, or 10 min before its last successful
+    /// read when that is older, never past retention. So a gap (laptop closed, failed reads)
+    /// is read on the next success.
+    fn floor(&self, source: &str, lookback: Duration) -> Ts {
+        let window = self.now - lookback;
+        let from = self.last_ok.get(source).map_or(window, |t| {
+            (t.to_utc() - Duration::minutes(CURSOR_OVERLAP_MINS)).min(window)
+        });
+        unix(from).max(self.retention_floor.clone())
+    }
 }
 
 /// `<@me>` plus the configured extra mention queries.
@@ -301,15 +355,15 @@ fn keep(
     })
 }
 
-/// `query` over the lookback window: its hits and whether they are complete (not truncated).
+/// `query` from `floor`: its hits and whether they are complete (not truncated).
 /// None (and a warning) when it fails.
 fn search(
     s: &dyn Slack,
     query: &str,
-    after: &str,
+    floor: &Ts,
     warn: &mut Vec<String>,
 ) -> Option<(Vec<Msg>, bool)> {
-    match sources::search(s, &format!("{query} {after}")) {
+    match sources::search(s, &format!("{query} {}", after_filter(floor))) {
         Ok(Searched {
             msgs, truncated, ..
         }) => {
@@ -355,16 +409,18 @@ fn read_watches(
     Ok(ws.watched.values().cloned().collect())
 }
 
-/// Source 6: curated channels' top-level posts in the channel window. `#name` entries resolve
-/// through cached names, else one conversations.list for the refresh.
+/// Source 6: curated channels' top-level posts since each channel's cursor. `#name` entries
+/// resolve through cached names, else one conversations.list for the refresh.
 fn read_channels(
     s: &dyn Slack,
     cfg: &Config,
     prev: &Cache,
     names: &mut Names,
-    win: &Windows,
+    cursors: &Cursors,
+    ok: &mut Vec<String>,
     warn: &mut Vec<String>,
 ) -> BTreeMap<String, Read<Vec<Msg>>> {
+    let lookback = Duration::hours(cfg.channel_lookback_hours.into());
     let mut listed: Option<Result<BTreeMap<String, String>, String>> = None;
     let mut unresolved = false;
     let mut out = BTreeMap::new();
@@ -401,7 +457,11 @@ fn read_channels(
                 }
             }
         };
-        let read = sources::history(s, &id, &win.channel_floor);
+        let key = format!("ch:{id}");
+        let read = sources::history(s, &id, &cursors.floor(&key, lookback));
+        if read.is_ok() {
+            ok.push(key);
+        }
         let read = keep(read, warn, &label(names, &id));
         out.insert(id, read);
     }
@@ -949,6 +1009,87 @@ mod tests {
         let cache = run_with(&fake, &Config::default(), &mut seeded(), &prev);
         assert_eq!(cache.warnings, ["@Dana: conversations.history: timed out"]);
         assert_eq!(cache.rows, [row]);
+    }
+
+    fn param(params: &[(String, String)], k: &str) -> String {
+        params.iter().find(|(key, _)| key == k).unwrap().1.clone()
+    }
+
+    fn history_oldest(fake: &FakeSlack, channel: &str) -> String {
+        let read = calls(fake, "conversations.history");
+        let p = read.iter().find(|p| has(p, "channel", channel)).unwrap();
+        param(p, "oldest")
+    }
+
+    /// F1: a closed laptop (63 h > the 48 h channel window) leaves no gap: each read reaches
+    /// back to 10 min before its last successful read, capped at retention.
+    #[test]
+    fn cursors_widen_reads_back_to_last_success() {
+        let mut state = State {
+            mpims: vec!["G0MPDM1".into()],
+            mpims_listed_at: Some(now()),
+            ..seeded()
+        };
+        let at = |secs: i64| Ts(ago(secs));
+        state.last_ok = BTreeMap::from([
+            ("ch:C0INC".into(), at(63 * 3600)),
+            ("ch:G0MPDM1".into(), at(9 * DAY)),
+            ("search:<@U0ME>".into(), at(10 * DAY)),
+            ("search:to:me".into(), at(20 * DAY)), // past retention: capped
+        ]);
+        let friday = ago(63 * 3600 - 60);
+        let fake = base().on(
+            "conversations.history",
+            &[("channel", "C0INC")],
+            Ok(&messages(&[msg(&friday, "U0THEO", "db failover")])),
+        );
+        let cache = run_with(&fake, &incidents(), &mut state, &Cache::default());
+        assert_eq!(history_oldest(&fake, "C0INC"), ago(63 * 3600 + 600));
+        assert_eq!(history_oldest(&fake, "G0MPDM1"), ago(9 * DAY + 600));
+        let searches = calls(&fake, "search.messages");
+        let query = |base: &str| {
+            searches
+                .iter()
+                .map(|p| param(p, "query"))
+                .find(|q| q.starts_with(&format!("{base} ")))
+                .unwrap()
+        };
+        let back = |secs: i64| sources::after(now() - Duration::seconds(secs) - Duration::days(1));
+        assert_eq!(
+            query("<@U0ME>"),
+            format!("<@U0ME> {}", back(10 * DAY + 600))
+        );
+        assert_eq!(query("to:me"), format!("to:me {}", back(14 * DAY)));
+        assert_eq!(query("from:me"), q("from:me")); // no cursor yet: the lookback
+        assert_eq!(keys(&cache), [format!("C0INC:{friday}").as_str()]);
+        // Every successful read moved its cursor to this refresh's start.
+        for key in ["ch:C0INC", "ch:G0MPDM1", "search:<@U0ME>", "search:to:me"] {
+            assert_eq!(state.last_ok[key], Ts(ago(0)), "{key}");
+        }
+        assert_eq!(state.last_ok["search:from:me"], Ts(ago(0)));
+    }
+
+    #[test]
+    fn cursors_stay_put_when_a_read_fails() {
+        let mut state = seeded();
+        let old = Ts(ago(3 * DAY));
+        state.last_ok = BTreeMap::from([
+            ("ch:C0INC".into(), old.clone()),
+            ("search:<@U0ME>".into(), old.clone()),
+        ]);
+        let capped =
+            r#"{"ok":true,"messages":{"paging":{"total":15000,"pages":150},"matches":[]}}"#;
+        let fake = base()
+            .on(
+                "conversations.history",
+                &[("channel", "C0INC")],
+                Err(SlackError::Http("conversations.history: timed out".into())),
+            )
+            .on("search.messages", &[], Ok(capped));
+        run_with(&fake, &incidents(), &mut state, &Cache::default());
+        assert_eq!(state.last_ok["ch:C0INC"], old);
+        assert_eq!(state.last_ok["search:<@U0ME>"], old);
+        assert!(!state.last_ok.contains_key("search:to:me"));
     }
 
     #[test]

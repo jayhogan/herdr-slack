@@ -41,6 +41,10 @@ pub struct State {
     pub mpims: Vec<String>,
     pub mpims_listed_at: Option<DateTime<Utc>>,
     pub mpim_cursor: usize,
+    /// Read cursors (§7 "Overlap"): source -> start of the refresh whose read of it last
+    /// succeeded. `ch:<id>` for curated channels and DMs, `search:<query>` per search query.
+    #[serde(default)]
+    pub last_ok: BTreeMap<String, Ts>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -81,6 +85,16 @@ mod tests {
         assert_eq!(dir.load::<State>(STATE).unwrap(), state);
         assert_eq!(dir.load::<Clears>(CLEARS).unwrap(), Clears::default());
         assert_ne!(CLEARS, STATE);
+    }
+
+    /// A state.json written before the read cursors existed still loads.
+    #[test]
+    fn older_state_json_loads() {
+        let json = r#"{"version":1,"refresh_no":4,"watch":{"baseline":null,"watched":{}},
+            "known_threads":{},"mpims":["G0MPDM1"],"mpims_listed_at":null,"mpim_cursor":0}"#;
+        let state: State = serde_json::from_str(json).unwrap();
+        assert_eq!(state.refresh_no, 4);
+        assert!(state.last_ok.is_empty());
     }
 
     #[test]
