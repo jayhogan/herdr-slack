@@ -53,16 +53,19 @@ pub fn run(
     let mut mention_errs = Vec::new();
     let queries = std::iter::once(format!("<@{my}>")).chain(cfg.extra_mention_queries.clone());
     for query in queries {
-        match search(s, &query, &after, &mut warn) {
-            Some(hits) => {
-                mention_hits.extend(hits.into_iter().map(|m| (msg_id(&m.channel, &m.ts), m)))
-            }
-            None => mention_errs.push(query),
+        // A truncated query can't prove a mention resolved: the read counts as failed (§7).
+        let (hits, complete) = search(s, &query, &after, &mut warn).unwrap_or_default();
+        mention_hits.extend(hits.into_iter().map(|m| (msg_id(&m.channel, &m.ts), m)));
+        if !complete {
+            mention_errs.push(query);
         }
     }
     let mention_hits: Vec<Msg> = mention_hits.into_values().collect();
-    let to_me = search(s, "to:me", &after, &mut warn).unwrap_or_default();
-    let from_me = search(s, "from:me", &after, &mut warn).unwrap_or_default();
+    // These only pick what to read (absent reads carry rows), so partial hits are safe to use.
+    let to_me = search(s, "to:me", &after, &mut warn).unwrap_or_default().0;
+    let from_me = search(s, "from:me", &after, &mut warn)
+        .unwrap_or_default()
+        .0;
 
     // DMs (before threads, so DM thread roots are read this refresh).
     if state
@@ -141,16 +144,20 @@ pub fn run(
         };
         Some((id, ts.clone()))
     });
+    // Within one quiet cycle of expiry, read every refresh: expiry needs a fresh read (§7).
+    let cycle = Duration::seconds((QUIET_EVERY * cfg.refresh_secs) as i64);
+    let near_expiry = unix(now - Duration::days(KNOWN_THREAD_DAYS) + cycle);
     let mut due: BTreeMap<ThreadId, bool> = BTreeMap::new();
     for (id, last) in known {
         let last = hinted
             .get(&id)
             .map_or(last.clone(), |h| h.clone().max(last));
         let key = msg_id(&id.channel, &id.root);
-        due.insert(id, thread_due(&key, &last, state.refresh_no, now));
+        let d = last <= near_expiry || thread_due(&key, &last, state.refresh_no, now);
+        due.insert(id, d);
     }
-    for id in hinted.into_keys() {
-        due.entry(id).or_insert(true);
+    for id in hinted.keys() {
+        due.entry(id.clone()).or_insert(true);
     }
     let mut threads = BTreeMap::new();
     for id in due.into_iter().filter(|(_, d)| *d).map(|(id, _)| id) {
@@ -178,15 +185,25 @@ pub fn run(
     readd_watches(&reads, clears, now);
     let rows = collect(&reads, &prev.rows, clears, &win);
 
-    for (id, ts) in activity(&reads) {
+    // Every hinted thread is tracked, even when its read failed, so it outlives its search hit.
+    for (id, ts) in hinted.into_iter().chain(activity(&reads)) {
         let at = state
             .known_threads
             .entry(msg_id(&id.channel, &id.root))
             .or_insert_with(|| ts.clone());
         *at = at.clone().max(ts);
     }
+    // Expire only what a successful read this refresh shows quiet for 14 days.
     let expiry = unix(now - Duration::days(KNOWN_THREAD_DAYS));
-    state.known_threads.retain(|_, ts| *ts >= expiry);
+    let read_ok: BTreeSet<String> = reads
+        .threads
+        .iter()
+        .filter(|(_, r)| r.is_ok())
+        .map(|(id, _)| msg_id(&id.channel, &id.root))
+        .collect();
+    state
+        .known_threads
+        .retain(|key, ts| *ts >= expiry || !read_ok.contains(key));
 
     let watched_rows = watch_rows(&state.watch);
     clears
@@ -273,8 +290,14 @@ fn keep(
     })
 }
 
-/// `query` over the lookback window; None (and a warning) when it fails.
-fn search(s: &dyn Slack, query: &str, after: &str, warn: &mut Vec<String>) -> Option<Vec<Msg>> {
+/// `query` over the lookback window: its hits and whether they are complete (not truncated).
+/// None (and a warning) when it fails.
+fn search(
+    s: &dyn Slack,
+    query: &str,
+    after: &str,
+    warn: &mut Vec<String>,
+) -> Option<(Vec<Msg>, bool)> {
     match sources::search(s, &format!("{query} {after}")) {
         Ok(Searched {
             msgs, truncated, ..
@@ -282,7 +305,7 @@ fn search(s: &dyn Slack, query: &str, after: &str, warn: &mut Vec<String>) -> Op
             if truncated {
                 warn.push(format!("{query}: truncated"));
             }
-            Some(msgs)
+            Some((msgs, !truncated))
         }
         Err(e) => {
             warn.push(format!("{query}: {}", describe(&e)));
@@ -781,6 +804,239 @@ mod tests {
         );
         assert_eq!(cache.rows, [row]);
         assert_eq!(state.known_threads[&key.0], Ts(ago(600)));
+    }
+
+    /// A previous-refresh row with one unhandled message.
+    fn prev_row(key: &str, kind: Kind, ts: &str, root: Option<&str>, user: &str) -> Row {
+        let channel = key.split_once(':').unwrap().0.to_owned();
+        let shown = Msg {
+            channel: channel.clone(),
+            ts: Ts(ts.into()),
+            thread_ts: root.map(|r| Ts(r.into())),
+            reply_count: 0,
+            user: user.into(),
+            subtype: None,
+            body: "waiting".into(),
+        };
+        Row {
+            key: RowKey(key.into()),
+            channel,
+            kinds: vec![kind],
+            oldest: shown.ts.clone(),
+            newest: shown.ts.clone(),
+            shown,
+            pending: 1,
+            watched: None,
+        }
+    }
+
+    fn prev_cache(row: &Row, channel_label: Option<&str>) -> Cache {
+        let mut names = Names::default();
+        names.users.insert(row.shown.user.clone(), "Dana".into());
+        if let Some(l) = channel_label {
+            names.channels.insert(row.channel.clone(), l.into());
+        }
+        Cache {
+            rows: vec![row.clone()],
+            names,
+            ..Cache::default()
+        }
+    }
+
+    fn run_with(fake: &FakeSlack, cfg: &Config, state: &mut State, prev: &Cache) -> Cache {
+        run(fake, cfg, state, &mut Clears::default(), prev, now()).unwrap()
+    }
+
+    #[test]
+    fn truncated_mention_search_keeps_rows() {
+        let row = prev_row(
+            "C0PLAT:1792097000.000100",
+            Kind::Mention,
+            "1792097000.000100",
+            None,
+            "U0MARCUS",
+        );
+        let prev = prev_cache(&row, Some("#platform"));
+        let capped =
+            r#"{"ok":true,"messages":{"paging":{"total":15000,"pages":150},"matches":[]}}"#;
+        let fake = base().on("search.messages", &[("query", &q("<@U0ME>"))], Ok(capped));
+        let cache = run_with(&fake, &Config::default(), &mut seeded(), &prev);
+        assert_eq!(cache.warnings, ["<@U0ME>: truncated"]);
+        assert_eq!(cache.rows, [row]);
+    }
+
+    #[test]
+    fn failed_mention_queries_warn_and_keep_rows() {
+        let row = prev_row(
+            "C0PLAT:1792097000.000100",
+            Kind::Mention,
+            "1792097000.000100",
+            None,
+            "U0MARCUS",
+        );
+        let prev = prev_cache(&row, Some("#platform"));
+        let cfg = Config {
+            extra_mention_queries: vec!["@core-team".into(), "@oncall".into()],
+            ..Config::default()
+        };
+        let down = || Err(SlackError::Http("search.messages: timed out".into()));
+        let fake = base()
+            .on("search.messages", &[("query", &q("@core-team"))], down())
+            .on("search.messages", &[("query", &q("@oncall"))], down());
+        let cache = run_with(&fake, &cfg, &mut seeded(), &prev);
+        assert_eq!(
+            cache.warnings,
+            [
+                "@core-team: search.messages: timed out",
+                "@oncall: search.messages: timed out"
+            ]
+        );
+        assert_eq!(cache.rows, [row]);
+    }
+
+    #[test]
+    fn unresolved_channel_keeps_rows() {
+        let row = prev_row(
+            "C0INC:1792099000.000100",
+            Kind::Channel,
+            "1792099000.000100",
+            None,
+            "U0THEO",
+        );
+        // No cached "#incidents" label, so the name needs conversations.list.
+        let prev = prev_cache(&row, None);
+        let failed = base().on(
+            "conversations.list",
+            &[],
+            Err(SlackError::Api("conversations.list: ratelimited".into())),
+        );
+        let cache = run_with(&failed, &incidents(), &mut seeded(), &prev);
+        assert_eq!(
+            cache.warnings,
+            ["#incidents: conversations.list: ratelimited"]
+        );
+        assert_eq!(cache.rows, std::slice::from_ref(&row));
+        let missing = base().on(
+            "conversations.list",
+            &[],
+            Ok(r#"{"ok":true,"channels":[{"id":"C0CORE","name":"core"}]}"#),
+        );
+        let cache = run_with(&missing, &incidents(), &mut seeded(), &prev);
+        assert_eq!(cache.warnings, ["#incidents: not found"]);
+        assert_eq!(cache.rows, [row]);
+    }
+
+    #[test]
+    fn failed_dm_history_keeps_row() {
+        let row = prev_row("D0DANA:dm", Kind::Dm, "1792098000.000100", None, "U0DANA");
+        let prev = prev_cache(&row, Some("@Dana"));
+        let fake = base().on(
+            "conversations.history",
+            &[("channel", "D0DANA")],
+            Err(SlackError::Http("conversations.history: timed out".into())),
+        );
+        let cache = run_with(&fake, &Config::default(), &mut seeded(), &prev);
+        assert_eq!(cache.warnings, ["@Dana: conversations.history: timed out"]);
+        assert_eq!(cache.rows, [row]);
+    }
+
+    #[test]
+    fn mpims_relisted_and_cursor_advances() {
+        let mut state = State {
+            mpims: vec!["G0STALE".into()],
+            mpims_listed_at: Some(now() - Duration::hours(7)),
+            ..seeded()
+        };
+        let cfg = Config {
+            refresh_secs: 300, // k = 2: one of the two group DMs per refresh
+            ..Config::default()
+        };
+        let listed = r#"{"ok":true,"channels":[{"id":"G0MPDM1"},{"id":"G0MPDM2"}]}"#;
+        let history_of = |fake: &FakeSlack| -> Vec<String> {
+            calls(fake, "conversations.history")
+                .iter()
+                .flat_map(|p| {
+                    p.iter()
+                        .filter(|(k, _)| k == "channel")
+                        .map(|(_, v)| v.clone())
+                })
+                .collect()
+        };
+        let first = base().on("users.conversations", &[], Ok(listed));
+        run_with(&first, &cfg, &mut state, &Cache::default());
+        assert_eq!(state.mpims, ["G0MPDM1", "G0MPDM2"]);
+        assert_eq!(state.mpims_listed_at, Some(now()));
+        assert_eq!(state.mpim_cursor, 1);
+        assert_eq!(history_of(&first), ["G0MPDM1"]);
+        let second = base();
+        run_with(&second, &cfg, &mut state, &Cache::default());
+        assert!(calls(&second, "users.conversations").is_empty());
+        assert_eq!(state.mpim_cursor, 0);
+        assert_eq!(history_of(&second), ["G0MPDM2"]);
+    }
+
+    #[test]
+    fn near_expiry_thread_is_read_and_failed_read_never_expires() {
+        let near_ts = ago(14 * DAY - 864); // 13.99 days
+        let root_ts = ago(20 * DAY);
+        let near = format!("C0NEAR:{root_ts}");
+        let gone = format!("C0GONE:{}", ago(20 * DAY));
+        // A refresh number where the hash schedule alone wouldn't read either.
+        let n = (0..5)
+            .find(|n| {
+                !thread_due(&near, &Ts(near_ts.clone()), *n, now())
+                    && !thread_due(&gone, &Ts(ago(15 * DAY)), *n, now())
+            })
+            .unwrap();
+        let mut state = State {
+            refresh_no: n,
+            ..seeded()
+        };
+        state.known_threads = BTreeMap::from([
+            (near.clone(), Ts(near_ts.clone())),
+            (gone.clone(), Ts(ago(15 * DAY))),
+        ]);
+        let fake = base()
+            .on(
+                "conversations.replies",
+                &[("channel", "C0NEAR")],
+                Ok(&messages(&[
+                    root(&root_ts, "U0ME", "rollout plan", 1),
+                    reply(&near_ts, &root_ts, "U0DANA", "one more question"),
+                ])),
+            )
+            .on(
+                "conversations.replies",
+                &[("channel", "C0GONE")],
+                Err(SlackError::Http("conversations.replies: timed out".into())),
+            );
+        let cache = run_with(&fake, &Config::default(), &mut state, &Cache::default());
+        assert_eq!(state.known_threads[&near], Ts(near_ts.clone()));
+        assert_eq!(keys(&cache), [near.as_str()]);
+        assert_eq!(cache.rows[0].kinds, [Kind::Reply]);
+        assert_eq!(cache.rows[0].shown.user, "U0DANA");
+        // Past 14 days but its read failed: still tracked.
+        assert_eq!(state.known_threads[&gone], Ts(ago(15 * DAY)));
+    }
+
+    #[test]
+    fn failed_new_thread_read_is_tracked() {
+        let new_root = ago(DAY);
+        let hit_ts = ago(DAY - 60);
+        let from_me = found(&[hit("C0NEW", &hit_ts, "U0ME", "on it", Some(&new_root))]);
+        let fake = base()
+            .on("search.messages", &[("query", &q("from:me"))], Ok(&from_me))
+            .on(
+                "conversations.replies",
+                &[("channel", "C0NEW")],
+                Err(SlackError::Http("conversations.replies: timed out".into())),
+            );
+        let mut state = seeded();
+        run_with(&fake, &Config::default(), &mut state, &Cache::default());
+        assert_eq!(
+            state.known_threads,
+            BTreeMap::from([(format!("C0NEW:{new_root}"), Ts(hit_ts))])
+        );
     }
 
     #[test]
