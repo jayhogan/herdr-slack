@@ -16,6 +16,7 @@ mod store;
 mod text;
 mod token;
 mod ui;
+mod verify;
 mod watch;
 
 use std::env;
@@ -35,7 +36,7 @@ use crate::fetch::{FetchEvent, FetchRequest, Poller};
 use crate::model::Row;
 use crate::refresh::describe;
 use crate::slack::{HttpSlack, Slack, SlackError};
-use crate::state::{CLEARS, Clear, Clears, Me};
+use crate::state::{CACHE, CLEARS, Cache, Clear, Clears, Me};
 use crate::store::StateDir;
 
 const USAGE: &str = "usage: herdr-slack [verify] [--fixtures]";
@@ -87,7 +88,7 @@ fn main() -> ExitCode {
     };
     let result = match args.cmd {
         Cmd::Tui => run_tui(args.fixtures),
-        Cmd::Verify => Err("verify is not implemented yet".into()),
+        Cmd::Verify => run_verify(),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -95,6 +96,22 @@ fn main() -> ExitCode {
             eprintln!("herdr-slack: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// `herdr-slack verify`: prints the report; fails when anything is unexplained.
+fn run_verify() -> Result<(), String> {
+    let cfg = config::load(&config::default_path())?;
+    let slack = HttpSlack::new(token::read()?, true);
+    let state = StateDir::default_location();
+    let cache: Cache = state.load(CACHE).map_err(|e| format!("{CACHE}: {e}"))?;
+    let clears: Clears = state.load(CLEARS).map_err(|e| format!("{CLEARS}: {e}"))?;
+    let report =
+        verify::run(&slack, &cfg, &cache, &clears, Utc::now()).map_err(|e| describe(&e))?;
+    println!("{}", report.text);
+    match report.unexplained {
+        0 => Ok(()),
+        n => Err(format!("{n} unexplained")),
     }
 }
 

@@ -43,16 +43,13 @@ pub fn run(
         channel_floor: unix(now - Duration::hours(cfg.channel_lookback_hours.into())),
         retention_floor: unix(now - Duration::days(cfg.retention_days.into())),
     };
-    // `after:` is day-granular, exclusive and in the user's timezone: one more day of overlap
-    // keeps the whole window [floor, now] covered (§7 "Overlap").
-    let after = sources::after(mention_floor - Duration::days(1));
+    let after = search_after(cfg, now);
 
     let watched = read_watches(s, my, cfg, &mut state.watch, &mut warn);
 
     let mut mention_hits = BTreeMap::new();
     let mut mention_errs = Vec::new();
-    let queries = std::iter::once(format!("<@{my}>")).chain(cfg.extra_mention_queries.clone());
-    for query in queries {
+    for query in mention_queries(my, cfg) {
         // A truncated query can't prove a mention resolved: the read counts as failed (§7).
         let (hits, complete) = search(s, &query, &after, &mut warn).unwrap_or_default();
         mention_hits.extend(hits.into_iter().map(|m| (msg_id(&m.channel, &m.ts), m)));
@@ -226,6 +223,20 @@ pub fn run(
         rows,
         names,
     })
+}
+
+/// The `after:` filter every search source uses. `after:` is day-granular, exclusive and in the
+/// user's timezone: one more day of overlap keeps the whole window [floor, now] covered (§7).
+pub(crate) fn search_after(cfg: &Config, now: DateTime<Utc>) -> String {
+    let mention_floor = now - Duration::days(cfg.lookback_days.into());
+    sources::after(mention_floor - Duration::days(1))
+}
+
+/// `<@me>` plus the configured extra mention queries.
+pub(crate) fn mention_queries(my: &str, cfg: &Config) -> Vec<String> {
+    std::iter::once(format!("<@{my}>"))
+        .chain(cfg.extra_mention_queries.clone())
+        .collect()
 }
 
 /// Quiet threads are read every 5th refresh, spread by a stable hash of the id.
