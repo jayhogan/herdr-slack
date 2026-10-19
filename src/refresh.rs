@@ -49,20 +49,20 @@ pub fn run(
     let watched = read_watches(s, my, cfg, &mut state.watch, &mut warn);
 
     let mut mention_hits = BTreeMap::new();
-    let mut mention_errs = Vec::new();
+    let mut mentions_complete = true;
     // Rows older than the floor every mention query covered count as aged out (§7).
     let mut mention_floor = unix(now - dm_back);
     for query in mention_queries(my, cfg) {
         let key = format!("search:{query}");
         let floor = cursors.floor(&key, dm_back);
         mention_floor = mention_floor.max(floor.clone());
-        // A truncated query can't prove a mention resolved: the read counts as failed (§7).
+        // Hits always count; a failed or truncated query can't prove a mention resolved (§7).
         let (hits, complete) = search(s, &query, &floor, &mut warn).unwrap_or_default();
         mention_hits.extend(hits.into_iter().map(|m| (msg_id(&m.channel, &m.ts), m)));
         if complete {
             ok.push(key);
         } else {
-            mention_errs.push(query);
+            mentions_complete = false;
         }
     }
     let mention_hits: Vec<Msg> = mention_hits.into_values().collect();
@@ -201,11 +201,8 @@ pub fn run(
         me: my.to_owned(),
         ignore: cfg.ignore_users.iter().cloned().collect(),
         watched,
-        mentions: if mention_errs.is_empty() {
-            Ok(mention_hits)
-        } else {
-            Err(format!("failed: {}", mention_errs.join(", ")))
-        },
+        mentions: mention_hits,
+        mentions_complete,
         threads,
         channels,
         dms,
@@ -977,6 +974,45 @@ mod tests {
             ]
         );
         assert_eq!(cache.rows, [row]);
+    }
+
+    /// F4: one failing mention query still lets the others' new mentions through, and keeps
+    /// the previous mention rows it might have held.
+    #[test]
+    fn one_failed_mention_query_keeps_the_others() {
+        let old = prev_row(
+            "C0PLAT:1792097000.000100",
+            Kind::Mention,
+            "1792097000.000100",
+            None,
+            "U0MARCUS",
+        );
+        let prev = prev_cache(&old, Some("#platform"));
+        let cfg = Config {
+            extra_mention_queries: vec!["@oncall".into()],
+            ..Config::default()
+        };
+        let new = found(&[hit(
+            "C0CORE",
+            "1792099500.000100",
+            "U0DANA",
+            "<@U0ME> can you check?",
+            None,
+        )]);
+        let fake = base()
+            .on("search.messages", &[("query", &q("<@U0ME>"))], Ok(&new))
+            .on(
+                "search.messages",
+                &[("query", &q("@oncall"))],
+                Err(SlackError::Http("search.messages: timed out".into())),
+            );
+        let cache = run_with(&fake, &cfg, &mut seeded(), &prev);
+        assert_eq!(cache.warnings, ["@oncall: search.messages: timed out"]);
+        assert_eq!(
+            keys(&cache),
+            ["C0CORE:1792099500.000100", "C0PLAT:1792097000.000100"]
+        );
+        assert_eq!(cache.rows[0].kinds, [Kind::Mention]);
     }
 
     #[test]

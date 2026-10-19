@@ -18,7 +18,9 @@ pub struct Reads {
     pub me: String,
     pub ignore: BTreeSet<String>, // config.ignore_users
     pub watched: Read<Vec<Msg>>,  // WatchState.watched after watch::apply, or Err
-    pub mentions: Read<Vec<Msg>>, // all mention queries merged
+    pub mentions: Vec<Msg>,       // hits of every mention query that answered, merged
+    /// Every mention query read its whole window: only then can a mention's absence resolve it.
+    pub mentions_complete: bool,
     pub threads: BTreeMap<ThreadId, Read<Vec<Msg>>>, // replies read this refresh (absent = not read)
     pub channels: BTreeMap<String, Read<Vec<Msg>>>,  // curated, top-level
     pub dms: BTreeMap<String, Read<Vec<Msg>>>, // IM / MPIM history, top-level (absent = not read)
@@ -215,7 +217,7 @@ fn answered(reads: &Reads, m: &Msg, key: &RowKey) -> bool {
 }
 
 fn mention_events<'a>(reads: &'a Reads, hints: &Hints, out: &mut Vec<Event<'a>>) {
-    for m in reads.mentions.iter().flatten() {
+    for m in &reads.mentions {
         let key = key_for(reads, hints, m);
         if counts(reads, m) && !answered(reads, m, &key) {
             out.push(Event {
@@ -374,7 +376,7 @@ fn unread(reads: &Reads, row: &Row, kind: Kind) -> bool {
     let thread_unread = || thread_id(row).is_none_or(|id| !is_ok(reads.threads.get(&id)));
     match kind {
         Kind::Watch => reads.watched.is_err(),
-        Kind::Mention => reads.mentions.is_err(),
+        Kind::Mention => !reads.mentions_complete,
         Kind::Reply | Kind::Thread => thread_unread(),
         Kind::Channel => matches!(reads.channels.get(&row.channel), Some(Err(_))),
         Kind::Dm => {
@@ -521,7 +523,8 @@ mod tests {
             me: ME.into(),
             ignore: BTreeSet::from(["B0NOISE".to_string()]),
             watched: Ok(vec![]),
-            mentions: Ok(vec![]),
+            mentions: vec![],
+            mentions_complete: true,
             threads: BTreeMap::new(),
             channels: BTreeMap::new(),
             dms: BTreeMap::new(),
@@ -584,7 +587,7 @@ mod tests {
         };
         r.threads
             .insert(tid(C, 1), Ok(vec![top.clone(), ask.clone()]));
-        r.mentions = Ok(vec![ask.clone()]);
+        r.mentions = vec![ask.clone()];
         r.watched = Ok(vec![top]);
         let rows = run(&r);
         assert_eq!(rows.len(), 1);
@@ -653,7 +656,7 @@ mod tests {
     fn mention_drops_after_i_answer() {
         let mut r = reads();
         let ask = reply(C, 2, 1, DANA);
-        r.mentions = Ok(vec![ask.clone()]);
+        r.mentions = vec![ask.clone()];
         // Thread not read this refresh: the mention stands.
         assert_eq!(run(&r)[0].kinds, [Kind::Mention]);
         r.threads.insert(
@@ -673,7 +676,7 @@ mod tests {
                 msg(C, 2, "B0NOISE", "deploy ok"),
             ]),
         );
-        r.mentions = Ok(vec![msg(C, 3, "B0NOISE", "<@U0ME> alert")]);
+        r.mentions = vec![msg(C, 3, "B0NOISE", "<@U0ME> alert")];
         r.dms.insert(D.into(), Ok(vec![msg(D, 4, ME, "hey Dana")]));
         assert!(run(&r).is_empty());
     }
@@ -921,7 +924,7 @@ mod tests {
         let ask = reply(C, 3, 1, MARCUS);
         let prev = row(RowKey::thread(C, &ts(1)), C, &[Kind::Mention], ask, 3, 1);
         let mut r = reads();
-        r.mentions = Err("ratelimited".into());
+        r.mentions_complete = false;
         let last = reply(C, 4, 1, DANA);
         r.threads.insert(
             tid(C, 1),
@@ -941,6 +944,28 @@ mod tests {
         );
         assert_eq!(rows[0].pending, 2);
         assert_eq!(rows[0].shown, last);
+    }
+
+    /// F4: an incomplete mention read still makes rows from its hits, and keeps a previous
+    /// mention row its hits no longer show.
+    #[test]
+    fn incomplete_mentions_add_rows_and_keep_old_ones() {
+        let old = msg(C, 3, MARCUS, "<@U0ME> old ask");
+        let prev = row(RowKey::thread(C, &ts(3)), C, &[Kind::Mention], old, 3, 1);
+        let new = msg("C0PLAT", 5, DANA, "<@U0ME> new ask");
+        let mut r = reads();
+        r.mentions = vec![new.clone()];
+        r.mentions_complete = false;
+        let rows = collect(&r, slice::from_ref(&prev), &Clears::default(), &win());
+        assert_eq!(
+            keys(&rows),
+            [prev.key.0.clone(), RowKey::thread("C0PLAT", &ts(5)).0]
+        );
+        assert_eq!(rows[1].shown, new);
+        // A complete read without the old mention resolves it.
+        r.mentions_complete = true;
+        let rows = collect(&r, &[prev], &Clears::default(), &win());
+        assert_eq!(keys(&rows), [RowKey::thread("C0PLAT", &ts(5)).0]);
     }
 
     #[test]
@@ -1023,14 +1048,14 @@ mod tests {
         // Search hits say reply_count 0 and carry no thread_ts for a root.
         let hit = msg(D, 5, DANA, "<@U0ME> thoughts?");
         let mut r = reads();
-        r.mentions = Ok(vec![hit.clone()]);
+        r.mentions = vec![hit.clone()];
         r.dms.insert(D.into(), Ok(vec![root(D, 5, DANA, 2)]));
         let rows = run(&r);
         assert_eq!(keys(&rows), [RowKey::thread(D, &ts(5)).0]);
         assert_eq!(rows[0].kinds, [Kind::Mention, Kind::Dm]);
         // Known threaded only from a thread read.
         let mut r = reads();
-        r.mentions = Ok(vec![hit]);
+        r.mentions = vec![hit];
         r.threads.insert(
             tid(D, 5),
             Ok(vec![root(D, 5, DANA, 1), reply(D, 6, 5, DANA)]),
