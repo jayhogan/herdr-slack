@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::model::{Kind, Msg, Row, RowKey, Ts};
+use crate::model::{Kind, Msg, Row, RowKey, Ts, msg_id};
 use crate::state::Clears;
 
 pub type Read<T> = Result<T, String>;
@@ -64,12 +64,13 @@ struct Event<'a> {
 }
 
 pub fn collect(reads: &Reads, prev: &[Row], clears: &Clears, win: &Windows) -> Vec<Row> {
+    let hints = hints(reads, prev);
     let mut events = Vec::new();
     watch_events(reads, &mut events);
-    mention_events(reads, &mut events);
+    mention_events(reads, &hints, &mut events);
     thread_events(reads, &mut events);
     channel_events(reads, &mut events);
-    dm_events(reads, &mut events);
+    dm_events(reads, &hints, &mut events);
     let mut rows = build(reads, clears, events);
     for p in apply_clears(prev.to_vec(), clears) {
         match rows.get_mut(&p.key) {
@@ -136,19 +137,48 @@ fn is_ok<T>(read: Option<&Read<T>>) -> bool {
     matches!(read, Some(Ok(_)))
 }
 
-fn is_watched(reads: &Reads, m: &Msg) -> bool {
-    reads
-        .watched
-        .as_ref()
-        .is_ok_and(|ws| ws.iter().any(|w| w.channel == m.channel && w.ts == m.ts))
+/// Message ids that must key their own thread row, whichever source reports them.
+struct Hints {
+    /// Roots known to have replies: a search hit always says `reply_count == 0`.
+    threaded: BTreeSet<String>,
+    /// Watched messages; the previous rows' watches when the watch read failed.
+    watched: BTreeSet<String>,
+}
+
+fn hints(reads: &Reads, prev: &[Row]) -> Hints {
+    let read_roots = reads.threads.keys().map(|id| msg_id(&id.channel, &id.root));
+    let history_roots = reads
+        .dms
+        .values()
+        .flatten()
+        .flatten()
+        .filter(|m| m.reply_count > 0)
+        .map(|m| msg_id(&m.channel, &m.ts));
+    let prev_roots = prev
+        .iter()
+        .filter(|r| thread_id(r).is_some())
+        .map(|r| r.key.0.clone());
+    let watched = match &reads.watched {
+        Ok(ws) => ws.iter().map(|m| msg_id(&m.channel, &m.ts)).collect(),
+        Err(_) => prev
+            .iter()
+            .filter_map(|r| Some(msg_id(&r.channel, r.watched.as_ref()?)))
+            .collect(),
+    };
+    Hints {
+        threaded: read_roots.chain(history_roots).chain(prev_roots).collect(),
+        watched,
+    }
 }
 
 /// Rule 2: top-level DM messages without replies and not watched share the DM row.
-fn key_for(reads: &Reads, m: &Msg) -> RowKey {
+fn key_for(reads: &Reads, hints: &Hints, m: &Msg) -> RowKey {
+    let id = msg_id(&m.channel, &m.ts);
     let dm_row = reads.dm_channels.contains(&m.channel)
         && is_top_level(m)
         && m.reply_count == 0
-        && !is_watched(reads, m);
+        && !hints.threaded.contains(&id)
+        && !hints.watched.contains(&id);
     if dm_row {
         RowKey::dm(&m.channel)
     } else {
@@ -184,9 +214,9 @@ fn answered(reads: &Reads, m: &Msg, key: &RowKey) -> bool {
     matches!(reads.threads.get(&id), Some(Ok(ms)) if mine_after(ms, false))
 }
 
-fn mention_events<'a>(reads: &'a Reads, out: &mut Vec<Event<'a>>) {
+fn mention_events<'a>(reads: &'a Reads, hints: &Hints, out: &mut Vec<Event<'a>>) {
     for m in reads.mentions.iter().flatten() {
-        let key = key_for(reads, m);
+        let key = key_for(reads, hints, m);
         if counts(reads, m) && !answered(reads, m, &key) {
             out.push(Event {
                 key,
@@ -238,32 +268,43 @@ fn channel_events<'a>(reads: &'a Reads, out: &mut Vec<Event<'a>>) {
     }
 }
 
-/// Rule 5: others' top-level messages after Jay's last top-level message there.
-fn dm_events<'a>(reads: &'a Reads, out: &mut Vec<Event<'a>>) {
+/// Rule 5: others' top-level messages after Jay's last top-level message there. A root that
+/// moved to its own thread row is answered by Jay's last message in that thread, once read.
+fn dm_events<'a>(reads: &'a Reads, hints: &Hints, out: &mut Vec<Event<'a>>) {
     for (ch, read) in &reads.dms {
         let Ok(msgs) = read else { continue };
         let tops = || msgs.iter().filter(|m| is_top_level(m));
         let last = my_last(reads, tops());
-        for m in tops().filter(|m| counts(reads, m) && after(last, &m.ts)) {
-            out.push(Event {
-                key: key_for(reads, m),
-                channel: ch,
-                kind: Kind::Dm,
-                msg: m,
-            });
+        for m in tops().filter(|m| counts(reads, m)) {
+            let key = key_for(reads, hints, m);
+            let id = ThreadId {
+                channel: ch.clone(),
+                root: m.ts.clone(),
+            };
+            let cutoff = match reads.threads.get(&id) {
+                Some(Ok(thread)) if key != RowKey::dm(ch) => my_last(reads, thread.iter()),
+                _ => last,
+            };
+            if after(cutoff, &m.ts) {
+                out.push(Event {
+                    key,
+                    channel: ch,
+                    kind: Kind::Dm,
+                    msg: m,
+                });
+            }
         }
     }
 }
 
-/// Rule 7: a thread row in a DM channel also honors the DM row's watermark.
-fn watermark(reads: &Reads, clears: &Clears, key: &RowKey, channel: &str) -> Option<Ts> {
-    let wm = |k: &RowKey| clears.entries.get(k).map(|c| c.wm.clone());
-    let dm = RowKey::dm(channel);
-    if *key != dm && reads.dm_channels.contains(channel) {
-        wm(key).max(wm(&dm))
-    } else {
-        wm(key)
+/// Rule 7 (controller ruling): the DM row's watermark carries only to a root that moved from
+/// the DM row to its own thread row, never to the thread's replies.
+fn dm_watermark<'c>(reads: &Reads, clears: &'c Clears, key: &RowKey, ch: &str) -> Option<&'c Ts> {
+    let dm = RowKey::dm(ch);
+    if *key == dm || !reads.dm_channels.contains(ch) {
+        return None;
     }
+    clears.entries.get(&dm).map(|c| &c.wm)
 }
 
 /// Rules 7 and 9: one row per key from its events.
@@ -283,8 +324,12 @@ fn build(reads: &Reads, clears: &Clears, events: Vec<Event>) -> BTreeMap<RowKey,
 
 fn build_row(reads: &Reads, clears: &Clears, key: &RowKey, evs: &[Event]) -> Option<Row> {
     let channel = evs[0].channel;
-    let wm = watermark(reads, clears, key, channel);
-    let fresh = |e: &&Event| e.kind == Kind::Watch || wm.as_ref().is_none_or(|w| e.msg.ts > *w);
+    let own = clears.entries.get(key).map(|c| &c.wm);
+    let dm_wm = dm_watermark(reads, clears, key, channel);
+    let fresh = |e: &&Event| {
+        let moved_root = dm_wm.is_some() && *key == RowKey::thread(channel, &e.msg.ts);
+        e.kind == Kind::Watch || (after(own, &e.msg.ts) && (!moved_root || after(dm_wm, &e.msg.ts)))
+    };
     let live: Vec<&Event> = evs.iter().filter(fresh).collect();
     let watch = live
         .iter()
@@ -345,10 +390,24 @@ fn floor(win: &Windows, kind: Kind) -> &Ts {
     }
 }
 
-/// Every non-watch kind's messages have left its lookback window (§7 "Aging out isn't resolving").
-fn aged_out(win: &Windows, row: &Row) -> bool {
-    let mut kinds = row.kinds.iter().filter(|k| **k != Kind::Watch).peekable();
-    kinds.peek().is_some() && kinds.all(|k| row.oldest < *floor(win, *k))
+/// Whether aging out can hide `kind`'s resolution: true unless a successful read that isn't
+/// window-limited (conversations.replies) would have rebuilt or answered it.
+fn window_limited(reads: &Reads, row: &Row, kind: Kind) -> bool {
+    let thread = thread_id(row).and_then(|id| reads.threads.get(&id)?.as_ref().ok());
+    match (kind, thread) {
+        (Kind::Watch | Kind::Reply | Kind::Thread, _) => false,
+        (Kind::Channel, _) | (_, None) => true,
+        (Kind::Mention | Kind::Dm, Some(msgs)) => {
+            my_last(reads, msgs.iter()).is_none_or(|l| *l < row.oldest)
+        }
+    }
+}
+
+/// Every non-watch kind's messages have left its lookback window, and one of them can only be
+/// resolved by a window-limited read (§7 "Aging out isn't resolving").
+fn aged_out(reads: &Reads, win: &Windows, row: &Row) -> bool {
+    let kinds = || row.kinds.iter().filter(|k| **k != Kind::Watch);
+    kinds().all(|k| row.oldest < *floor(win, *k)) && kinds().any(|k| window_limited(reads, row, *k))
 }
 
 /// A successful watch read that no longer holds the row's watch removes it.
@@ -371,12 +430,19 @@ fn carry(reads: &Reads, win: &Windows, mut row: Row) -> Option<Row> {
     if row.kinds.is_empty() || (row.newest < win.retention_floor && !has_watch) {
         return None;
     }
-    let keep = row.kinds.iter().any(|k| unread(reads, &row, *k)) || aged_out(win, &row);
+    let keep = row.kinds.iter().any(|k| unread(reads, &row, *k)) || aged_out(reads, win, &row);
     keep.then_some(row)
 }
 
 /// A rebuilt row keeps what an earlier refresh saw from a source that wasn't read this time.
 fn merge(reads: &Reads, row: &mut Row, mut prev: Row) {
+    // A failed watch read can't rebuild the watch: keep the one the previous row had.
+    if reads.watched.is_err() && prev.kinds.contains(&Kind::Watch) {
+        if !row.kinds.contains(&Kind::Watch) {
+            row.kinds.insert(0, Kind::Watch);
+        }
+        row.watched = row.watched.take().or(prev.watched.clone());
+    }
     if !prev
         .kinds
         .iter()
@@ -922,5 +988,116 @@ mod tests {
         r.threads.insert(tid(C, 7), Err("ratelimited".into()));
         r.dms.insert(D.into(), Ok(vec![msg(D, 9, DANA, "hi")]));
         assert_eq!(activity(&r), BTreeMap::from([(tid(C, 1), ts(5))]));
+    }
+
+    #[test]
+    fn dm_clear_keeps_unseen_thread_replies() {
+        // Root t5 got Dana's reply t6; Jay then clears the DM row at t10.
+        let mut r = reads();
+        let c = clears(&[(RowKey::dm(D), 10, false)]);
+        r.dms.insert(
+            D.into(),
+            Ok(vec![root(D, 5, DANA, 1), msg(D, 10, DANA, "later")]),
+        );
+        r.threads.insert(
+            tid(D, 5),
+            Ok(vec![root(D, 5, DANA, 1), reply(D, 6, 5, DANA)]),
+        );
+        let rows = collect(&r, &[], &c, &win());
+        assert_eq!(keys(&rows), [RowKey::thread(D, &ts(5)).0]);
+        assert_eq!(rows[0].pending, 1);
+        assert_eq!(rows[0].shown.ts, ts(6));
+    }
+
+    #[test]
+    fn dm_thread_row_resolves_when_i_reply_in_thread() {
+        let mut r = reads();
+        r.dms.insert(D.into(), Ok(vec![root(D, 5, DANA, 1)]));
+        r.threads
+            .insert(tid(D, 5), Ok(vec![root(D, 5, DANA, 1), reply(D, 6, 5, ME)]));
+        assert!(run(&r).is_empty());
+    }
+
+    #[test]
+    fn search_mention_on_dm_root_joins_its_thread_row() {
+        // Search hits say reply_count 0 and carry no thread_ts for a root.
+        let hit = msg(D, 5, DANA, "<@U0ME> thoughts?");
+        let mut r = reads();
+        r.mentions = Ok(vec![hit.clone()]);
+        r.dms.insert(D.into(), Ok(vec![root(D, 5, DANA, 2)]));
+        let rows = run(&r);
+        assert_eq!(keys(&rows), [RowKey::thread(D, &ts(5)).0]);
+        assert_eq!(rows[0].kinds, [Kind::Mention, Kind::Dm]);
+        // Known threaded only from a thread read.
+        let mut r = reads();
+        r.mentions = Ok(vec![hit]);
+        r.threads.insert(
+            tid(D, 5),
+            Ok(vec![root(D, 5, DANA, 1), reply(D, 6, 5, DANA)]),
+        );
+        assert_eq!(keys(&run(&r)), [RowKey::thread(D, &ts(5)).0]);
+    }
+
+    #[test]
+    fn watch_kept_on_rebuilt_row_when_watch_read_fails() {
+        let mut prev = prev_thread_row();
+        prev.kinds = vec![Kind::Watch, Kind::Thread];
+        prev.watched = Some(ts(1));
+        let mut r = reads();
+        r.watched = Err("ratelimited".into());
+        r.threads.insert(
+            tid(C, 1),
+            Ok(vec![
+                root(C, 1, DANA, 3),
+                reply(C, 2, 1, ME),
+                reply(C, 3, 1, DANA),
+                reply(C, 4, 1, DANA),
+            ]),
+        );
+        let rows = collect(&r, &[prev], &Clears::default(), &win());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kinds, [Kind::Watch, Kind::Thread]);
+        assert_eq!(rows[0].watched, Some(ts(1)));
+    }
+
+    #[test]
+    fn watched_dm_message_stays_one_row_when_watch_read_fails() {
+        let eyes = msg(D, 3, DANA, "remind me");
+        let mut prev = row(
+            RowKey::thread(D, &ts(3)),
+            D,
+            &[Kind::Watch],
+            eyes.clone(),
+            3,
+            0,
+        );
+        prev.watched = Some(ts(3));
+        let mut r = reads();
+        r.watched = Err("ratelimited".into());
+        r.dms.insert(D.into(), Ok(vec![eyes]));
+        let rows = collect(&r, &[prev], &Clears::default(), &win());
+        assert_eq!(keys(&rows), [RowKey::thread(D, &ts(3)).0]);
+        assert_eq!(rows[0].kinds, [Kind::Watch, Kind::Dm]);
+        assert_eq!(rows[0].watched, Some(ts(3)));
+    }
+
+    #[test]
+    fn aged_thread_row_resolved_by_successful_read() {
+        let aged = Windows {
+            mention_floor: ts(10),
+            channel_floor: ts(10),
+            ..win()
+        };
+        let mut r = reads();
+        r.threads.insert(
+            tid(C, 1),
+            Ok(vec![
+                root(C, 1, DANA, 3),
+                reply(C, 2, 1, ME),
+                reply(C, 3, 1, DANA),
+                reply(C, 4, 1, ME),
+            ]),
+        );
+        assert!(collect(&r, &[prev_thread_row()], &Clears::default(), &aged).is_empty());
     }
 }
