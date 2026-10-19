@@ -188,18 +188,6 @@ impl Worker {
             Utc::now(),
         );
         let now = Utc::now();
-        if result.is_ok() {
-            // The worker is state.json's only writer. clears.json is the UI's: apply only this
-            // refresh's changes to the latest copy. A failed write is retried by the next
-            // refresh, which reads the old files again.
-            let _ = self.state.update(STATE, |s: &mut State| {
-                *s = state;
-                true
-            });
-            let _ = self.state.update(CLEARS, |latest: &mut Clears| {
-                apply_clear_deltas(&seen, &clears, latest)
-            });
-        }
         let apply = |c: &mut Cache| match &result {
             Ok(new) => *c = new.clone(),
             // Keep the previous rows; the error is shown over them.
@@ -208,18 +196,46 @@ impl Worker {
                 c.error_at = Some(now);
             }
         };
-        self.state
-            .update(CACHE, |c: &mut Cache| {
-                apply(c);
-                true
-            })
-            .unwrap_or_else(|io| {
+        // cache.json first: state.json only advances once its rows are published.
+        let mut cache = match self.state.update(CACHE, |c: &mut Cache| {
+            apply(c);
+            true
+        }) {
+            Ok(cache) => cache,
+            Err(io) => {
                 let mut c = self.load();
                 apply(&mut c);
                 c.error = Some(SlackError::Api(format!("could not write {CACHE}: {io}")));
                 c.error_at = Some(now);
-                c
-            })
+                return c;
+            }
+        };
+        if result.is_err() {
+            return cache;
+        }
+        // The worker is state.json's only writer. clears.json is the UI's: apply only this
+        // refresh's changes to the latest copy.
+        let mut failed = Vec::new();
+        if let Err(io) = self.state.update(STATE, |s: &mut State| {
+            *s = state;
+            true
+        }) {
+            failed.push(format!("could not write {STATE}: {io}"));
+        }
+        if let Err(io) = self.state.update(CLEARS, |latest: &mut Clears| {
+            apply_clear_deltas(&seen, &clears, latest)
+        }) {
+            failed.push(format!("could not write {CLEARS}: {io}"));
+        }
+        if !failed.is_empty() {
+            cache.warnings.extend(failed.iter().cloned());
+            // If this fails too, the returned cache still shows the warnings.
+            let _ = self.state.update(CACHE, |c: &mut Cache| {
+                c.warnings.extend(failed);
+                true
+            });
+        }
+        cache
     }
 }
 
@@ -539,6 +555,53 @@ mod tests {
         assert_eq!(latest.entries[&key("new")], moved);
         assert_eq!(latest.entries[&key("kept")], seen.entries[&key("kept")]);
         assert!(!apply_clear_deltas(&seen, &seen, &mut latest.clone()));
+    }
+
+    #[test]
+    fn cache_write_failure_leaves_state_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = StateDir::new(tmp.path().to_path_buf());
+        let before: State = state
+            .update(STATE, |s: &mut State| {
+                s.refresh_no = 7;
+                true
+            })
+            .unwrap();
+        std::fs::create_dir(tmp.path().join(CACHE)).unwrap();
+        let fake = FakeSlack::new().on("auth.test", &[], Ok(AUTH_OK));
+        let (tx, rx) = spawn(Box::new(fake), Config::default(), state);
+        tx.send(FetchRequest::Forced).unwrap();
+        let cache = done(&until_done(&rx)).clone();
+        let Some(SlackError::Api(msg)) = &cache.error else {
+            panic!("{:?}", cache.error)
+        };
+        assert!(msg.starts_with("could not write cache.json: "), "{msg}");
+        let disk = StateDir::new(tmp.path().to_path_buf());
+        assert_eq!(disk.load::<State>(STATE).unwrap(), before);
+        assert!(!tmp.path().join(CLEARS).exists());
+    }
+
+    #[test]
+    fn state_write_failure_warns_in_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(STATE)).unwrap();
+        let fake = FakeSlack::new().on("auth.test", &[], Ok(AUTH_OK));
+        let (tx, rx) = spawn(
+            Box::new(fake),
+            Config::default(),
+            StateDir::new(tmp.path().to_path_buf()),
+        );
+        tx.send(FetchRequest::Forced).unwrap();
+        let cache = done(&until_done(&rx)).clone();
+        assert_eq!(cache.error, None);
+        let warned = |c: &Cache| {
+            c.warnings
+                .iter()
+                .any(|w| w.starts_with("could not write state.json: "))
+        };
+        assert!(warned(&cache), "{:?}", cache.warnings);
+        let disk: Cache = StateDir::new(tmp.path().to_path_buf()).load(CACHE).unwrap();
+        assert_eq!(disk, cache);
     }
 
     #[test]
