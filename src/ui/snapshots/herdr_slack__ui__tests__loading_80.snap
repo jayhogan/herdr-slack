@@ -1,0 +1,16 @@
+---
+source: src/ui/mod.rs
+expression: "text(&draw(&a, 80, 12))"
+---
+Slack inbox │ 0 need attention   sort: oldest waiting
+ Loading Slack…
+
+
+
+
+
+
+
+Refreshing…
+j/k move  ␣ expand  o open  O open+clear  x clear  u undo  r refresh  s sort
+g/G top/bottom  q quit

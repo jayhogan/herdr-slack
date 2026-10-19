@@ -1,0 +1,19 @@
+[package]
+name = "herdr-slack"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "What needs you in Slack."
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+crossterm = "0.29"
+ratatui = "0.30"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = "3"
+unicode-width = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+insta = "1"

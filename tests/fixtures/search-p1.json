@@ -1,0 +1,3 @@
+{"ok":true,"query":"<@U0ME>","messages":{"total":3,"paging":{"count":2,"total":3,"page":1,"pages":2},"matches":[
+{"ts":"1792096026.762699","text":"<@U0ME> can you look at the deploy plan?","user":"U0DANA","channel":{"id":"C0CORE","name":"core"},"permalink":"https://heard.slack.com/archives/C0CORE/p1792096026762699"},
+{"ts":"1792096100.000300","text":"<@U0ME> following up","user":"U0MARCUS","channel":{"id":"C0CORE","name":"core"},"permalink":"https://heard.slack.com/archives/C0CORE/p1792096100000300?thread_ts=1792096026.762699&cid=C0CORE"}]}}

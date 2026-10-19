@@ -1,0 +1,4 @@
+{"ok":true,"items":[
+{"type":"message","channel":"C0CORE","message":{"ts":"1792096026.762699","user":"U0DANA","text":"deploy plan attached","reactions":[{"name":"eyes","users":["U0ME"],"count":1}]}},
+{"type":"message","channel":"C0CORE","message":{"ts":"1792096100.000300","user":"U0MARCUS","text":"not mine","reactions":[{"name":"eyes","users":["U0THEO"],"count":1}]}},
+{"type":"message","channel":"D0DANA","message":{"ts":"1792096200.000400","user":"U0PRIYA","text":"shipped","reactions":[{"name":"tada","users":["U0ME"],"count":1}]}}]}
