@@ -6,6 +6,8 @@ mod ago;
 
 // Compiled for tests only until a later task wires a caller.
 #[cfg(test)]
+mod collect;
+#[cfg(test)]
 mod config;
 #[cfg(test)]
 mod model;
@@ -21,6 +23,8 @@ mod store;
 mod text;
 #[cfg(test)]
 mod token;
+#[cfg(test)]
+mod watch;
 
 use std::env;
 use std::process::ExitCode;
