@@ -68,6 +68,8 @@ pub fn run(
     }
     let mention_hits: Vec<Msg> = mention_hits.into_values().collect();
     // These only pick what to read (absent reads carry rows), so partial hits are safe to use.
+    // How far back `to:me` looked: a 1:1 DM it finds for the first time is read from there.
+    let to_me_floor = cursors.floor("search:to:me", dm_back);
     let mut search_other = |query: &str| {
         let key = format!("search:{query}");
         let floor = cursors.floor(&key, dm_back);
@@ -87,6 +89,10 @@ pub fn run(
 
     // DMs (before threads, so DM thread roots are read this refresh).
     let mut new_mpims = Vec::new();
+    // A group DM missing from the previous listing appeared after it: read it from there.
+    let listed_floor = state
+        .mpims_listed_at
+        .map(|t| unix(t - Duration::minutes(CURSOR_OVERLAP_MINS)));
     if state
         .mpims_listed_at
         .is_none_or(|t| now - t >= Duration::minutes(MPIM_RELIST_MINS))
@@ -125,11 +131,19 @@ pub fn run(
         .collect();
     dm_reads.extend(dm_rows);
     dm_reads.extend(slice);
-    dm_reads.extend(new_mpims);
+    dm_reads.extend(new_mpims.iter().cloned());
     let mut dms = BTreeMap::new();
     for ch in dm_reads {
         let key = format!("ch:{ch}");
-        let read = sources::history(s, &ch, &cursors.floor(&key, dm_back));
+        let covered = if is_im(&ch) {
+            Some(to_me_floor.clone())
+        } else if new_mpims.contains(&ch) {
+            listed_floor.clone()
+        } else {
+            None
+        };
+        let floor = cursors.first_read_floor(&key, dm_back, covered);
+        let read = sources::history(s, &ch, &floor);
         if read.is_ok() {
             ok.push(key);
         }
@@ -304,6 +318,19 @@ impl Cursors {
             (t.to_utc() - Duration::minutes(CURSOR_OVERLAP_MINS)).min(window)
         });
         unix(from).max(self.retention_floor.clone())
+    }
+
+    /// `floor`, except that a source never read before starts at `covered` (how far back the
+    /// app already looked for it) when that is older: a conversation first seen after a long
+    /// gap is read across the gap, not just the lookback.
+    fn first_read_floor(&self, source: &str, lookback: Duration, covered: Option<Ts>) -> Ts {
+        let floor = self.floor(source, lookback);
+        match covered {
+            Some(c) if !self.last_ok.contains_key(source) => {
+                c.min(floor).max(self.retention_floor.clone())
+            }
+            _ => floor,
+        }
     }
 }
 
@@ -1165,6 +1192,64 @@ mod tests {
         assert_eq!(state.last_ok["ch:C0INC"], old);
         assert_eq!(state.last_ok["search:<@U0ME>"], old);
         assert!(!state.last_ok.contains_key("search:to:me"));
+    }
+
+    /// A conversation read for the first time reaches back as far as the app was already
+    /// covering: a 1:1 DM to where `to:me` searched, a new group DM to the previous listing.
+    /// So a DM from someone new, sent during a long gap, isn't cut off at the 7-day lookback.
+    #[test]
+    fn first_dm_read_reaches_back_to_its_discovery() {
+        let mut state = State {
+            mpims: vec!["G0OLD".into()],
+            mpims_listed_at: Some(now() - Duration::days(9)),
+            ..seeded()
+        };
+        state.last_ok = BTreeMap::from([
+            ("search:to:me".into(), Ts(ago(12 * DAY))),
+            ("ch:G0OLD".into(), Ts(ago(9 * DAY))),
+        ]);
+        let sent = ago(10 * DAY);
+        let to_me = format!(
+            "to:me {}",
+            sources::after(now() - Duration::seconds(12 * DAY + 600) - Duration::days(1))
+        );
+        let listed = r#"{"ok":true,"channels":[{"id":"G0OLD"},{"id":"G0NEW"}]}"#;
+        let fake = base()
+            .on(
+                "search.messages",
+                &[("query", &to_me)],
+                Ok(&found(&[hit("D0NEW", &sent, "U0NORA", "hi", None)])),
+            )
+            .on("users.conversations", &[], Ok(listed))
+            .on(
+                "conversations.history",
+                &[("channel", "D0NEW")],
+                Ok(&messages(&[msg(&sent, "U0NORA", "hi")])),
+            );
+        let cache = run_with(&fake, &Config::default(), &mut state, &Cache::default());
+        assert_eq!(history_oldest(&fake, "D0NEW"), ago(12 * DAY + 600));
+        assert_eq!(history_oldest(&fake, "G0NEW"), ago(9 * DAY + 600));
+        assert!(keys(&cache).contains(&"D0NEW:dm"), "{:?}", keys(&cache));
+    }
+
+    /// On the very first run there's nothing to reach back to: new DMs use the lookback.
+    #[test]
+    fn first_dm_read_on_first_run_uses_the_lookback() {
+        let mut state = seeded();
+        let fake = base()
+            .on(
+                "search.messages",
+                &[("query", &q("to:me"))],
+                Ok(&found(&[hit("D0NEW", &ago(DAY), "U0NORA", "hi", None)])),
+            )
+            .on(
+                "users.conversations",
+                &[],
+                Ok(r#"{"ok":true,"channels":[{"id":"G0NEW"}]}"#),
+            );
+        run_with(&fake, &Config::default(), &mut state, &Cache::default());
+        assert_eq!(history_oldest(&fake, "D0NEW"), ago(7 * DAY));
+        assert_eq!(history_oldest(&fake, "G0NEW"), ago(7 * DAY));
     }
 
     /// F7: group DMs are re-listed every 10 minutes, and a new one is read in that refresh.

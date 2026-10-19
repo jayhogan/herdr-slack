@@ -135,7 +135,9 @@ until the reaction is gone.
   lookback window stay until cleared or past retention. Each search, curated channel and DM
   remembers when it was last read successfully, and the next read reaches back to 10 minutes
   before that (never past retention) when that is older than its lookback window, so a closed
-  laptop or a run of failed refreshes leaves no gap. Search windows overlap by one more day.
+  laptop or a run of failed refreshes leaves no gap. Search windows overlap by one more day. A DM
+  read for the first time reaches back as far as the app was already looking: a 1:1 DM to where
+  the `to:me` search reached, a new group DM to the previous group-DM listing.
 - A DM becomes one row keyed by the channel; a DM message with replies or a watch gets its own
   thread row and leaves the DM row.
 - Not covered: threads you follow without having posted in them, Slack's own "Later" list (no API;
