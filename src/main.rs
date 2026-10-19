@@ -23,7 +23,7 @@ use std::env;
 use std::io;
 use std::process::ExitCode;
 use std::sync::mpsc::{Receiver, Sender};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use chrono::{DateTime, Utc};
 use crossterm::event::{self, Event, KeyEventKind};
@@ -158,7 +158,7 @@ fn fixtures(cfg: Config, now: DateTime<Utc>) -> (App, Mode) {
 /// Starts the worker when there is a token; otherwise shows the auth banner.
 fn connect(app: &mut App, cfg: &Config) -> Mode {
     match token::read() {
-        Ok(token) => Mode::Live(Box::new(Live::start(token, cfg))),
+        Ok(token) => Mode::Live(Box::new(Live::start(token, cfg, app))),
         Err(e) => {
             app.set_auth_error(e);
             Mode::NoToken
@@ -174,12 +174,44 @@ struct Live {
     state: StateDir,
     slack_ui: HttpSlack,
     next_clears_reload: Instant,
+    /// cache.json's mtime when last shown.
+    cache_seen: Option<SystemTime>,
     /// From the last cache that had it; needed for `slack://` URLs.
     me: Option<Me>,
 }
 
+/// Shows cache.json when it changed since `seen` (another pane's refresh, §6); true if it did.
+fn sync_cache(
+    state: &StateDir,
+    seen: &mut Option<SystemTime>,
+    app: &mut App,
+    me: &mut Option<Me>,
+) -> bool {
+    let Some(mtime) = state.modified(CACHE) else {
+        return false;
+    };
+    if *seen == Some(mtime) {
+        return false;
+    }
+    // An unreadable file keeps what is shown; try again next tick.
+    let Ok(cache) = state.load::<Cache>(CACHE) else {
+        return false;
+    };
+    *seen = Some(mtime);
+    if cache.me.is_some() {
+        me.clone_from(&cache.me);
+    }
+    app.set_cache(cache);
+    true
+}
+
 impl Live {
-    fn start(token: String, cfg: &Config) -> Live {
+    /// Shows the shared cache at once (§2 "opens instantly from cache"), then starts the worker.
+    fn start(token: String, cfg: &Config, app: &mut App) -> Live {
+        let state = StateDir::default_location();
+        let mut cache_seen = None;
+        let mut me = None;
+        sync_cache(&state, &mut cache_seen, app, &mut me);
         let worker_slack = Box::new(HttpSlack::new(token.clone(), true));
         let (requests, events) =
             fetch::spawn(worker_slack, cfg.clone(), StateDir::default_location());
@@ -188,14 +220,16 @@ impl Live {
             requests,
             events,
             poller: Poller::new(now, Duration::from_secs(cfg.refresh_secs)),
-            state: StateDir::default_location(),
+            state,
             slack_ui: HttpSlack::new(token, false),
             next_clears_reload: now,
-            me: None,
+            cache_seen,
+            me,
         }
     }
 
-    /// Reloads clears.json every 2 s, sends due requests and applies every arrived event.
+    /// Every 2 s reloads clears.json and, when it changed, cache.json; then sends due
+    /// requests and applies every arrived event.
     fn tick(&mut self, app: &mut App) {
         let now = Instant::now();
         if now >= self.next_clears_reload {
@@ -203,6 +237,7 @@ impl Live {
             if let Ok(clears) = self.state.load::<Clears>(CLEARS) {
                 app.set_clears(clears);
             }
+            sync_cache(&self.state, &mut self.cache_seen, app, &mut self.me);
             self.next_clears_reload = now + CLEARS_EVERY;
         }
         for req in self.poller.due(now) {
@@ -740,6 +775,44 @@ mod tests {
             vec!["https://heard.slack.com/archives/x".to_string()]
         );
         assert_eq!(state.load::<Clears>(CLEARS).unwrap(), Clears::default());
+    }
+
+    /// F2: a new pane shows the shared cache before its first request, and picks up another
+    /// pane's refresh on the 2 s tick once cache.json changes.
+    #[test]
+    fn cache_json_is_shown_and_followed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = StateDir::new(tmp.path().to_path_buf());
+        let mut a = App::new(Config::default());
+        let mut me_seen = None;
+        let mut seen = None;
+        assert!(
+            !sync_cache(&state, &mut seen, &mut a, &mut me_seen),
+            "no file yet"
+        );
+        let sample = sample_cache(now());
+        state
+            .update(CACHE, |c: &mut Cache| {
+                *c = sample.clone();
+                true
+            })
+            .unwrap();
+        assert!(sync_cache(&state, &mut seen, &mut a, &mut me_seen));
+        assert_eq!(a.rows().len(), 9);
+        assert_eq!(me_seen, sample.me);
+        assert!(
+            !sync_cache(&state, &mut seen, &mut a, &mut me_seen),
+            "unchanged"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+        state
+            .update(CACHE, |c: &mut Cache| {
+                c.rows.truncate(2);
+                true
+            })
+            .unwrap();
+        assert!(sync_cache(&state, &mut seen, &mut a, &mut me_seen));
+        assert_eq!(a.rows().len(), 2);
     }
 
     #[test]

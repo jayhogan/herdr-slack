@@ -8,6 +8,7 @@ use std::io::{self, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
+use std::time::SystemTime;
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -94,6 +95,11 @@ impl StateDir {
         }
         Ok(value)
         // `lock` is released when dropped here.
+    }
+
+    /// When `name` was last written; None when it doesn't exist or can't be read.
+    pub fn modified(&self, name: &str) -> Option<SystemTime> {
+        fs::metadata(self.dir.join(name)).ok()?.modified().ok()
     }
 
     /// Non-blocking: `None` when another instance holds the fetch lock. The
