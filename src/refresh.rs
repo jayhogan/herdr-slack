@@ -19,7 +19,8 @@ const ACTIVE_DAYS: i64 = 2;
 const QUIET_EVERY: u64 = 5;
 /// Known threads stop being tracked after this long with no activity (§6 step 5).
 const KNOWN_THREAD_DAYS: i64 = 14;
-const MPIM_RELIST_HOURS: i64 = 6;
+/// Group DMs are re-listed this often (one Tier-3 call), so a new one shows promptly.
+const MPIM_RELIST_MINS: i64 = 10;
 /// Every group DM is read at least this often (§6 step 7).
 const MPIM_WINDOW_SECS: u64 = 600;
 
@@ -85,12 +86,19 @@ pub fn run(
     };
 
     // DMs (before threads, so DM thread roots are read this refresh).
+    let mut new_mpims = Vec::new();
     if state
         .mpims_listed_at
-        .is_none_or(|t| now - t > Duration::hours(MPIM_RELIST_HOURS))
+        .is_none_or(|t| now - t >= Duration::minutes(MPIM_RELIST_MINS))
     {
         match sources::mpims(s) {
             Ok(ids) => {
+                // Not in the previous list: read now rather than when the slice gets there.
+                new_mpims = ids
+                    .iter()
+                    .filter(|id| !state.mpims.contains(id))
+                    .cloned()
+                    .collect();
                 state.mpims = ids;
                 state.mpims_listed_at = Some(now);
             }
@@ -117,6 +125,7 @@ pub fn run(
         .collect();
     dm_reads.extend(dm_rows);
     dm_reads.extend(slice);
+    dm_reads.extend(new_mpims);
     let mut dms = BTreeMap::new();
     for ch in dm_reads {
         let key = format!("ch:{ch}");
@@ -1158,6 +1167,52 @@ mod tests {
         assert!(!state.last_ok.contains_key("search:to:me"));
     }
 
+    /// F7: group DMs are re-listed every 10 minutes, and a new one is read in that refresh.
+    #[test]
+    fn new_group_dm_read_when_listed() {
+        let channels_of = |fake: &FakeSlack| -> Vec<String> {
+            calls(fake, "conversations.history")
+                .iter()
+                .map(|p| param(p, "channel"))
+                .collect()
+        };
+        let mpims: Vec<String> = (0..10).map(|i| format!("G0MP{i:03}")).collect();
+        let mut listed = mpims.clone();
+        listed.push("G0NEW".into());
+        let body = format!(
+            r#"{{"ok":true,"channels":[{}]}}"#,
+            listed
+                .iter()
+                .map(|id| format!(r#"{{"id":"{id}"}}"#))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let state = State {
+            mpims: mpims.clone(),
+            last_refresh_at: Some(now() - Duration::seconds(50)), // slice of 1
+            ..seeded()
+        };
+        // Listed 9 minutes ago: not yet.
+        let mut fresh = State {
+            mpims_listed_at: Some(now() - Duration::minutes(9)),
+            ..state.clone()
+        };
+        let fake = base().on("users.conversations", &[], Ok(&body));
+        run_with(&fake, &Config::default(), &mut fresh, &Cache::default());
+        assert!(calls(&fake, "users.conversations").is_empty());
+        assert_eq!(channels_of(&fake), ["G0MP000"]);
+        // Listed 11 minutes ago: re-listed, and the new one read now.
+        let mut stale = State {
+            mpims_listed_at: Some(now() - Duration::minutes(11)),
+            ..state
+        };
+        let fake = base().on("users.conversations", &[], Ok(&body));
+        run_with(&fake, &Config::default(), &mut stale, &Cache::default());
+        assert_eq!(calls(&fake, "users.conversations").len(), 1);
+        assert_eq!(stale.mpims, listed);
+        assert_eq!(channels_of(&fake), ["G0MP000", "G0NEW"]);
+    }
+
     #[test]
     fn mpims_relisted_and_cursor_advances() {
         let mut state = State {
@@ -1183,7 +1238,8 @@ mod tests {
         assert_eq!(state.mpims, ["G0MPDM1", "G0MPDM2"]);
         assert_eq!(state.mpims_listed_at, Some(now()));
         assert_eq!(state.mpim_cursor, 1);
-        assert_eq!(history_of(&first), ["G0MPDM1"]);
+        // Both are new to the list, so both are read now.
+        assert_eq!(history_of(&first), ["G0MPDM1", "G0MPDM2"]);
         let second = base();
         state.last_refresh_at = Some(now() - Duration::seconds(300));
         run_with(&second, &cfg, &mut state, &Cache::default());
@@ -1609,7 +1665,7 @@ mod tests {
         let read = calls(&fake, "conversations.replies");
         assert_eq!(read.len(), 1);
         assert!(has(&read[0], "ts", "1792097000.000100"));
-        assert!(calls(&fake, "users.conversations").is_empty()); // listed < 6 h ago
+        assert!(calls(&fake, "users.conversations").is_empty()); // listed < 10 min ago
         assert_eq!(keys(&cache), ["G0MPDM1:1792097000.000100"]);
         let row = &cache.rows[0];
         assert_eq!(row.kinds, [Kind::Dm]);
