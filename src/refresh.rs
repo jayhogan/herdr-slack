@@ -489,13 +489,14 @@ fn read_channels(
     let mut unresolved = false;
     let mut out = BTreeMap::new();
     for entry in &cfg.channels {
+        // Slack ids are uppercase letters and digits; anything else is a name.
+        let is_id = entry
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit());
         let name = match entry.strip_prefix('#') {
             Some(name) => Some(name),
-            // Slack ids are uppercase letters and digits; anything else is a name.
-            None if !entry.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit()) => {
-                Some(entry.as_str())
-            }
-            None => None,
+            None if is_id => None,
+            None => Some(entry.as_str()),
         };
         let id = match name {
             None => entry.clone(),
