@@ -472,8 +472,9 @@ fn read_watches(
     Ok(ws.watched.values().cloned().collect())
 }
 
-/// Source 6: curated channels' top-level posts since each channel's cursor. `#name` entries
-/// resolve through cached names, else one conversations.list for the refresh.
+/// Source 6: curated channels' top-level posts since each channel's cursor. Name entries
+/// (`#name`, or a bare `name` that can't be an id) resolve through cached names, else one
+/// conversations.list for the refresh.
 fn read_channels(
     s: &dyn Slack,
     cfg: &Config,
@@ -488,9 +489,18 @@ fn read_channels(
     let mut unresolved = false;
     let mut out = BTreeMap::new();
     for entry in &cfg.channels {
-        let id = match entry.strip_prefix('#') {
+        let name = match entry.strip_prefix('#') {
+            Some(name) => Some(name),
+            // Slack ids are uppercase letters and digits; anything else is a name.
+            None if !entry.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit()) => {
+                Some(entry.as_str())
+            }
+            None => None,
+        };
+        let id = match name {
             None => entry.clone(),
             Some(name) => {
+                let entry = &format!("#{name}");
                 let cached = names.channels.iter().find(|(_, l)| *l == entry);
                 let found = match cached {
                     Some((id, _)) => Ok(Some(id.clone())),
@@ -828,6 +838,27 @@ mod tests {
         // `#incidents` resolved to its id and kept for next time.
         assert_eq!(cache.names.channels["C0INC"], "#incidents");
         assert_eq!(cache.names.users["U0MARCUS"], "Dana");
+    }
+
+    #[test]
+    fn bare_channel_name_resolves_like_hash_name() {
+        let fake = full_fake();
+        let cfg = Config {
+            channels: vec!["incidents".into()],
+            ..Config::default()
+        };
+        let cache = run(
+            &fake,
+            &cfg,
+            &mut seeded(),
+            &mut Clears::default(),
+            &Cache::default(),
+            now(),
+        )
+        .unwrap();
+        assert_eq!(cache.warnings, Vec::<String>::new());
+        assert!(keys(&cache).contains(&"C0INC:1792099000.000100"));
+        assert_eq!(cache.names.channels["C0INC"], "#incidents");
     }
 
     #[test]
