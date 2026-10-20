@@ -98,7 +98,7 @@ missing file means defaults. Set `channels` to the channels you want to follow (
 
 | Field | Default | Meaning |
 |---|---|---|
-| `channels` | `[]` | Curated channels whose new top-level posts show up, as `#name` or an id |
+| `channels` | `[]` | Curated channels whose new top-level posts show up, as `#name`, `name` or an id |
 | `watch_emoji` | `["eyes"]` | Reactions that mark a message as a watch |
 | `extra_mention_queries` | `[]` | Extra searches counted as mentions, e.g. a user group |
 | `lookback_days` | `7` | Window for mentions, DMs and your own posts |
