@@ -1,0 +1,15 @@
+{
+  "type": "message",
+  "bot_id": "B0LINEAR",
+  "ts": "1792096200.000300",
+  "text": " ​",
+  "attachments": [
+    {
+      "id": 1,
+      "color": "5e6ad2",
+      "blocks": [
+        { "type": "section", "text": { "type": "mrkdwn", "text": "*Haven chat cards: re-entry and streaming display*" } }
+      ]
+    }
+  ]
+}

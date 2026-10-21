@@ -10,9 +10,10 @@ fn s<'a>(v: &'a Value, key: &str) -> &'a str {
 }
 
 /// Text of a message: `text`, else its blocks, else its attachments (spec §8).
+/// With none readable, a label so the row is never blank.
 pub fn flatten(v: &Value) -> String {
     let text = s(v, "text");
-    if !text.is_empty() {
+    if !is_blank(text) {
         return text.to_owned();
     }
     let from_blocks = v
@@ -20,13 +21,38 @@ pub fn flatten(v: &Value) -> String {
         .and_then(Value::as_array)
         .map(|bs| join_nonempty(bs.iter().map(block_text)))
         .unwrap_or_default();
-    if !from_blocks.is_empty() {
+    if !is_blank(&from_blocks) {
         return from_blocks;
     }
-    v.get("attachments")
+    let from_attachments = v
+        .get("attachments")
         .and_then(Value::as_array)
         .map(|az| join_nonempty(az.iter().map(attachment_text)))
-        .unwrap_or_default()
+        .unwrap_or_default();
+    if !is_blank(&from_attachments) {
+        return from_attachments;
+    }
+    let has_files = v
+        .get("files")
+        .and_then(Value::as_array)
+        .is_some_and(|fs| !fs.is_empty());
+    if has_files {
+        "[Files were uploaded]"
+    } else {
+        "[Rich content]"
+    }
+    .to_owned()
+}
+
+/// Bots often send `text` as a space or zero-width character to carry a card.
+fn is_blank(t: &str) -> bool {
+    t.chars().all(|c| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                '\u{200b}' | '\u{200c}' | '\u{200d}' | '\u{2060}' | '\u{feff}'
+            )
+    })
 }
 
 fn join_nonempty(parts: impl Iterator<Item = String>) -> String {
@@ -319,6 +345,24 @@ mod tests {
         let s = flatten(&fixture(include_str!("../tests/fixtures/msg-attach.json")));
         assert!(s.contains("Error rate high"), "{s}");
         assert!(s.contains("5xx rate is 4% on core-api"), "{s}");
+    }
+
+    #[test]
+    fn flatten_skips_blank_text() {
+        let v = serde_json::json!({"text": " \u{200b}\n", "blocks": [{"type":"header","text":{"text":"real"}}]});
+        assert_eq!(flatten(&v), "real");
+    }
+
+    #[test]
+    fn flatten_labels_unreadable_cards() {
+        let s = flatten(&fixture(include_str!("../tests/fixtures/msg-card.json")));
+        assert_eq!(s, "[Rich content]");
+    }
+
+    #[test]
+    fn flatten_labels_file_uploads() {
+        let s = flatten(&fixture(include_str!("../tests/fixtures/msg-files.json")));
+        assert_eq!(s, "[Files were uploaded]");
     }
 
     #[test]
